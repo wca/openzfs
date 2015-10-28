@@ -454,7 +454,7 @@ txg_sync_thread(dsl_pool_t *dp)
 	callb_cpr_t cpr;
 	uint64_t start, delta;
 
-	snprintf(name, sizeof (name), "sync %s", spa_name(spa));
+	(void) snprintf(name, sizeof (name), "sync %s", spa_name(spa));
 	txg_thread_enter(tx, &cpr, name);
 
 	start = delta = 0;
@@ -535,7 +535,7 @@ txg_quiesce_thread(dsl_pool_t *dp)
 	tx_state_t *tx = &dp->dp_tx;
 	callb_cpr_t cpr;
 
-	snprintf(name, sizeof (name), "quiesce %s", spa_name(spa));
+	(void) snprintf(name, sizeof (name), "quiesce %s", spa_name(spa));
 	txg_thread_enter(tx, &cpr, name);
 
 	for (;;) {
