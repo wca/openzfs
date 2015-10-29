@@ -216,8 +216,7 @@ txg_sync_start(dsl_pool_t *dp)
 	mutex_exit(&tx->tx_sync_lock);
 }
 
-/* This is CB_MAXNAME + 1; <sys/taskq.h> can't be #include'd here. */
-#define	TXG_THREAD_MAXNAMELEN	31 + 1
+#define	TXG_THREAD_MAXNAMELEN	CALLB_MAXNAME + 1
 static void
 txg_thread_enter(tx_state_t *tx, callb_cpr_t *cpr, char *thrname)
 {
