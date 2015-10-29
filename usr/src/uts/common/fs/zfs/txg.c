@@ -30,7 +30,6 @@
 #include <sys/dmu_tx.h>
 #include <sys/dsl_pool.h>
 #include <sys/dsl_scan.h>
-#include <sys/taskq.h> /* for TASKQ_NAMELEN (aka CB_MAXNAME) */
 #include <sys/callb.h>
 
 /*
@@ -217,7 +216,8 @@ txg_sync_start(dsl_pool_t *dp)
 	mutex_exit(&tx->tx_sync_lock);
 }
 
-#define	TXG_THREAD_MAXNAMELEN	TASKQ_NAMELEN + 1
+/* This is CB_MAXNAME + 1; <sys/taskq.h> can't be #include'd here. */
+#define	TXG_THREAD_MAXNAMELEN	31 + 1
 static void
 txg_thread_enter(tx_state_t *tx, callb_cpr_t *cpr, char *thrname)
 {
