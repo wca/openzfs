@@ -1558,31 +1558,48 @@ dump_deadlist(dsl_deadlist_t *dl)
 static avl_tree_t idx_tree;
 static avl_tree_t domain_tree;
 static boolean_t fuid_table_loaded;
+objset_t *sa_os = NULL;
 sa_attr_type_t *sa_attr_table = NULL;
 
 static int
-check_sa_attr_table(objset_t *os)
+open_objset(const char *path, dmu_objset_type_t type, void *tag, objset_t **osp)
 {
+	int err;
 	uint64_t sa_attrs = 0;
 	uint64_t version;
-	int error;
 
-	if (sa_attr_table != NULL)
-		return (0);
+	VERIFY3P(sa_os, ==, NULL);
+	err = dmu_objset_own(path, type, /*readonly*/ B_TRUE, tag, osp);
+	if (err != 0) {
+		(void) fprintf(stderr, "Can't own dataset '%s': %s\n", path,
+		    strerror(err));
+		return (err);
+	}
 
-	VERIFY(zap_lookup(os, MASTER_NODE_OBJ, ZPL_VERSION_STR,
-	    8, 1, &version) == 0);
+	VERIFY0(zap_lookup(*osp, MASTER_NODE_OBJ, ZPL_VERSION_STR,
+	    8, 1, &version));
 	if (version >= ZPL_VERSION_SA) {
-		VERIFY(zap_lookup(os, MASTER_NODE_OBJ, ZFS_SA_ATTRS,
-		    8, 1, &sa_attrs) == 0);
+		VERIFY0(zap_lookup(*osp, MASTER_NODE_OBJ, ZFS_SA_ATTRS,
+		    8, 1, &sa_attrs));
 	}
-	if ((error = sa_setup(os, sa_attrs, zfs_attr_table,
-	    ZPL_END, &sa_attr_table)) != 0) {
-		(void) printf("sa_setup failed errno %d, can't "
-		    "display znode contents\n", error);
-		return (error);
+	err = sa_setup(*osp, sa_attrs, zfs_attr_table, ZPL_END, &sa_attr_table);
+	if (err != 0) {
+		(void) fprintf(stderr, "sa_setup failed: %s\n", strerror(err));
+		dmu_objset_disown(*osp, tag);
+		*osp = NULL;
 	}
+	sa_os = *osp;
 	return (0);
+}
+
+static void
+close_objset(objset_t *os, void *tag)
+{
+	VERIFY3P(os, ==, sa_os);
+	sa_tear_down(os);
+	dmu_objset_disown(os, tag);
+	sa_attr_table = NULL;
+	sa_os = NULL;
 }
 
 static void
@@ -1655,10 +1672,7 @@ dump_znode(objset_t *os, uint64_t object, void *data, size_t size)
 	int idx = 0;
 	int error;
 
-	error = check_sa_attr_table(os);
-	if (error != 0)
-		return;
-
+	VERIFY3P(os, ==, sa_os);
 	if (sa_handle_get(os, object, NULL, SA_HDL_PRIVATE, &hdl)) {
 		(void) printf("Failed to get handle for SA znode\n");
 		return;
@@ -2131,7 +2145,7 @@ dump_label_uberblocks(vdev_label_t *lbl, uint64_t ashift)
 }
 
 static int
-dump_specific_file(objset_t *os, uint64_t obj)
+dump_specific_path(objset_t *os, uint64_t obj)
 {
 	int print_header = 0;
 
@@ -2142,7 +2156,7 @@ dump_specific_file(objset_t *os, uint64_t obj)
 }
 
 static int
-dump_specific_directory(objset_t *os, uint64_t obj, char *name)
+dump_specific_directory(objset_t *os, uint64_t obj, char *topname, char *name)
 {
 	int err;
 	uint64_t child_obj;
@@ -2186,8 +2200,13 @@ dump_specific_directory(objset_t *os, uint64_t obj, char *name)
 
 	switch (doi.doi_type) {
 	case DMU_OT_PLAIN_FILE_CONTENTS:
-		ASSERT3P(slash, ==, NULL);
-		return (dump_specific_file(os, child_obj));
+		if (slash != NULL) {
+			*slash = '\0';
+			fprintf(stderr, "Error: Path '/%s' specifies a file!\n",
+			    topname);
+			return (EINVAL);
+		}
+		return (dump_specific_path(os, child_obj));
 	case DMU_OT_DIRECTORY_CONTENTS:
 		if (slash == NULL) {
 			if (dump_opt['v'] > 6)
@@ -2195,9 +2214,10 @@ dump_specific_directory(objset_t *os, uint64_t obj, char *name)
 				    "directory at the end of the chain\n",
 				    obj, name);
 			/* Directory is the end of the chain */
-			return (dump_specific_file(os, child_obj));
+			return (dump_specific_path(os, child_obj));
 		}
-		return (dump_specific_directory(os, child_obj, slash + 1));
+		return (dump_specific_directory(os, child_obj, topname,
+		    slash + 1));
 	default:
 		fprintf(stderr, "Object %lu has non-file/directory type %d!\n",
 		    obj, doi.doi_type);
@@ -2210,8 +2230,7 @@ static int
 dump_file_path(int argc, char **argv)
 {
 	int err;
-	dsl_dataset_t *ds;
-	char *curp, *last;
+	char *ds_path, *file_path;
 	objset_t *os;
 	uint64_t root_obj;
 
@@ -2220,39 +2239,35 @@ dump_file_path(int argc, char **argv)
 		fprintf(stderr, "Must specify dataset and path\n");
 		return (EINVAL);
 	}
-	if (argv[1][0] != '/') {
+	ds_path = argv[0];
+	file_path = argv[1];
+	if (file_path[0] != '/') {
 		fprintf(stderr, "Must specify absolute path\n");
 		return (EINVAL);
 	}
-	err = dmu_objset_own(argv[0], DMU_OST_ZFS, B_TRUE, FTAG, &os);
-	if (err != 0) {
-		fprintf(stderr, "Can't own dataset '%s': %s\n", argv[0],
-		    strerror(err));
+	err = open_objset(ds_path, DMU_OST_ZFS, FTAG, &os);
+	if (err != 0)
 		return (err);
-	}
 
-	check_sa_attr_table(os);
 	err = zap_lookup(os, MASTER_NODE_OBJ, ZFS_ROOT_OBJ, 8, 1, &root_obj);
 	if (err != 0) {
 		fprintf(stderr, "Can't lookup root znode: %s\n", strerror(err));
 		dmu_objset_disown(os, FTAG);
 		return (EINVAL);
 	}
-	err = dump_specific_directory(os, root_obj, argv[1] + 1);
-	dmu_objset_disown(os, FTAG);
-	sa_attr_table = NULL;
+	file_path += 1; /* skip past the slash */
+	err = dump_specific_directory(os, root_obj, file_path, file_path);
+	close_objset(os, FTAG);
 	return (err);
 }
 
 static enum dmu_object_type
 objtype_from_string(char *objtype_str)
 {
-	enum dmu_object_type ot;
-
-	for (ot = DMU_OT_NONE; ot < DMU_OT_NUMTYPES; ot++) {
-		if (strcmp(objtype_str, dmu_ot[ot].ot_name) == 0)
-			return (ot);
-	}
+	if (strcmp(objtype_str, "file") == 0)
+		return (DMU_OT_PLAIN_FILE_CONTENTS);
+	if (strcmp(objtype_str, "directory") == 0)
+		return (DMU_OT_DIRECTORY_CONTENTS);
 	return (DMU_OT_NONE);
 }
 
@@ -2365,11 +2380,9 @@ dump_one_dir(const char *dsname, void *arg)
 	int error;
 	objset_t *os;
 
-	error = dmu_objset_own(dsname, DMU_OST_ANY, B_TRUE, FTAG, &os);
-	if (error) {
-		(void) printf("Could not open %s, error %d\n", dsname, error);
+	error = open_objset(dsname, DMU_OST_ANY, FTAG, &os);
+	if (error != 0)
 		return (0);
-	}
 
 	for (spa_feature_t f = 0; f < SPA_FEATURES; f++) {
 		if (!dmu_objset_ds(os)->ds_feature_inuse[f])
@@ -2380,9 +2393,8 @@ dump_one_dir(const char *dsname, void *arg)
 	}
 
 	dump_dir(os);
-	dmu_objset_disown(os, FTAG);
+	close_objset(os, FTAG);
 	fuid_table_destroy();
-	sa_attr_table = NULL;
 	return (0);
 }
 
@@ -3686,7 +3698,7 @@ main(int argc, char **argv)
 	nvlist_t *policy = NULL;
 	uint64_t max_txg = UINT64_MAX;
 	int rewind = ZPOOL_NEVER_REWIND;
-	const char *flags = "bcdehilmop:r:st:uvx:ACDFI:LMPRSU:X";
+	const char *flags = "bcdehilmop:st:uvx:ACDFI:LMPRSU:X";
 
 	(void) setrlimit(RLIMIT_NOFILE, &rl);
 	(void) enable_extended_FILE_stdio(-1, -1);
@@ -3884,8 +3896,7 @@ main(int argc, char **argv)
 				}
 			}
 		} else {
-			error = dmu_objset_own(target, DMU_OST_ANY,
-			    B_TRUE, FTAG, &os);
+			error = open_objset(target, DMU_OST_ANY, FTAG, &os);
 		}
 	}
 	nvlist_free(policy);
@@ -3928,10 +3939,9 @@ main(int argc, char **argv)
 			zdb_read_block(argv[i], spa);
 	}
 
-	(os != NULL) ? dmu_objset_disown(os, FTAG) : spa_close(spa, FTAG);
+	(os != NULL) ? close_objset(os, FTAG) : spa_close(spa, FTAG);
 
 	fuid_table_destroy();
-	sa_attr_table = NULL;
 
 	libzfs_fini(g_zfs);
 	kernel_fini();
