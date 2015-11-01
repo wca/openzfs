@@ -2172,7 +2172,7 @@ dump_specific_directory(objset_t *os, uint64_t obj, char *topname, char *name)
 		*slash = '/';
 
 	if (err != 0) {
-		fprintf(stderr, "Looking up '%s' failed: %s\n",
+		(void) fprintf(stderr, "Looking up '%s' failed: %s\n",
 		    name, strerror(err));
 		return (err);
 	}
@@ -2180,21 +2180,22 @@ dump_specific_directory(objset_t *os, uint64_t obj, char *topname, char *name)
 	child_obj = ZFS_DIRENT_OBJ(child_obj);
 	err = sa_buf_hold(os, child_obj, FTAG, &db);
 	if (err != 0) {
-		fprintf(stderr, "Can't get SA dbuf for obj %lu: %s\n",
-		    obj, strerror(err));
+		(void) fprintf(stderr, "Can't get SA dbuf for obj %llu: %s\n",
+		    (u_longlong_t)obj, strerror(err));
 		return (EINVAL);
 	}
 	dmu_object_info_from_db(db, &doi);
 	sa_buf_rele(db, FTAG);
 
 	if (dump_opt['v'] > 6)
-		fprintf(stderr, "%s: obj %lu name '%s' type %d bonustype %d\n",
-		    __func__, obj, name, doi.doi_type, doi.doi_bonus_type);
+		(void) fprintf(stderr, "%s: obj %llu name '%s' type %d "
+		    "bonustype %d\n", __func__, (u_longlong_t)obj, name,
+		    doi.doi_type, doi.doi_bonus_type);
 
 	if (doi.doi_bonus_type != DMU_OT_SA &&
 	    doi.doi_bonus_type != DMU_OT_ZNODE) {
-		fprintf(stderr, "Invalid bonus type %d for obj %lu!\n",
-		    doi.doi_bonus_type, obj);
+		(void) fprintf(stderr, "Invalid bonus type %d for obj %llu!\n",
+		    doi.doi_bonus_type, (u_longlong_t)obj);
 		return (EINVAL);
 	}
 
@@ -2202,25 +2203,25 @@ dump_specific_directory(objset_t *os, uint64_t obj, char *topname, char *name)
 	case DMU_OT_PLAIN_FILE_CONTENTS:
 		if (slash != NULL) {
 			*slash = '\0';
-			fprintf(stderr, "Error: Path '/%s' specifies a file!\n",
-			    topname);
+			(void) fprintf(stderr, "Error: Path '/%s' specifies "
+			    "a file!\n", topname);
 			return (EINVAL);
 		}
 		return (dump_specific_path(os, child_obj));
 	case DMU_OT_DIRECTORY_CONTENTS:
 		if (slash == NULL) {
 			if (dump_opt['v'] > 6)
-				fprintf(stderr, "Obj %lu name '%s' is a "
-				    "directory at the end of the chain\n",
-				    obj, name);
+				(void) fprintf(stderr, "Obj %llu name '%s' is "
+				    "a directory at the end of the chain\n",
+				    (u_longlong_t)obj, name);
 			/* Directory is the end of the chain */
 			return (dump_specific_path(os, child_obj));
 		}
 		return (dump_specific_directory(os, child_obj, topname,
 		    slash + 1));
 	default:
-		fprintf(stderr, "Object %lu has non-file/directory type %d!\n",
-		    obj, doi.doi_type);
+		(void) fprintf(stderr, "Object %llu has non-file/directory "
+		    "type %d!\n", (u_longlong_t)obj, doi.doi_type);
 		return (EINVAL);
 	}
 	/*NOTREACHED*/
@@ -2236,13 +2237,13 @@ dump_file_path(int argc, char **argv)
 
 	/* identifiers: <dataset> <path> */
 	if (argc < 2) {
-		fprintf(stderr, "Must specify dataset and path\n");
+		(void) fprintf(stderr, "Must specify dataset and path\n");
 		return (EINVAL);
 	}
 	ds_path = argv[0];
 	file_path = argv[1];
 	if (file_path[0] != '/') {
-		fprintf(stderr, "Must specify absolute path\n");
+		(void) fprintf(stderr, "Must specify absolute path\n");
 		return (EINVAL);
 	}
 	err = open_objset(ds_path, DMU_OST_ZFS, FTAG, &os);
@@ -2251,7 +2252,8 @@ dump_file_path(int argc, char **argv)
 
 	err = zap_lookup(os, MASTER_NODE_OBJ, ZFS_ROOT_OBJ, 8, 1, &root_obj);
 	if (err != 0) {
-		fprintf(stderr, "Can't lookup root znode: %s\n", strerror(err));
+		(void) fprintf(stderr, "Can't lookup root znode: %s\n",
+		    strerror(err));
 		dmu_objset_disown(os, FTAG);
 		return (EINVAL);
 	}
@@ -2286,7 +2288,7 @@ dump_specific_object(int argc, char **argv)
 	case DMU_OT_DIRECTORY_CONTENTS:
 		return (dump_file_path(argc - 1, argv + 1));
 	default:
-		fprintf(stderr, "Unknown object type '%s'\n", argv[0]);
+		(void) fprintf(stderr, "Unknown object type '%s'\n", argv[0]);
 		return (1);
 	}
 	/*NOTREACHED*/
