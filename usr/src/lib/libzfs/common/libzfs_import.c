@@ -1175,7 +1175,7 @@ zpool_find_import_impl(libzfs_handle_t *hdl, importargs_t *iarg)
 		 * close(2) processing, so we replace /dev/dsk with /dev/rdsk.
 		 */
 		if (strcmp(path, ZFS_DISK_ROOTD) == 0)
-			strncpy(path, ZFS_RDISK_ROOTD, sizeof (path));
+			(void) strncpy(path, ZFS_RDISK_ROOTD, sizeof (path));
 		else
 			rdsk = path;
 

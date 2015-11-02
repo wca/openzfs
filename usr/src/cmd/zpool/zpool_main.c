@@ -750,7 +750,7 @@ errout:
 	if (name != NULL)
 		free(name);
 	if (fd > 0)
-		close(fd);
+		(void) close(fd);
 
 	return (ret);
 }
