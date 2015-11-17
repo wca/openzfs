@@ -116,6 +116,12 @@ dbuf_hash(void *os, uint64_t obj, uint8_t lvl, uint64_t blkid)
 	return (crc);
 }
 
+#define	DBUF_STATE_CHANGE(db, op, state, why) do {			\
+	(db)->db_state op state;					\
+	DTRACE_PROBE2(dbuf__state_change, dmu_buf_impl_t *, db,		\
+	    const char *, why);						\
+} while (0)
+
 #define	DBUF_HASH(os, obj, level, blkid) dbuf_hash(os, obj, level, blkid);
 
 #define	DBUF_EQUAL(dbuf, os, obj, level, blkid)		\
@@ -395,6 +401,8 @@ dbuf_verify(dmu_buf_impl_t *db)
 {
 	dnode_t *dn;
 	dbuf_dirty_record_t *dr;
+	dbuf_dirty_record_t *dr_next;
+	dbuf_dirty_record_t *pending;
 
 	ASSERT(MUTEX_HELD(&db->db_mtx));
 
@@ -427,11 +435,23 @@ dbuf_verify(dmu_buf_impl_t *db)
 		ASSERT3U(db->db.db_offset, ==, db->db_blkid * db->db.db_size);
 	}
 
-	for (dr = db->db_data_pending; dr != NULL; dr = dr->dr_next)
+	pending = NULL;
+	for (dr = list_head(&db->db_dirty_records); dr != NULL; dr = dr_next) {
+		dr_next = list_next(&db->db_dirty_records, dr);
 		ASSERT(dr->dr_dbuf == db);
-
-	for (dr = db->db_last_dirty; dr != NULL; dr = dr->dr_next)
-		ASSERT(dr->dr_dbuf == db);
+		ASSERT(dr_next == NULL || dr->dr_txg > dr_next->dr_txg);
+		/* This DR happens to be the pending DR. */
+		if (dr == db->db_data_pending) {
+			pending = dr;
+			ASSERT(dr_next == NULL);
+		}
+	}
+	if (db->db_data_pending != NULL) {
+		/* The pending DR's dbuf is this dbuf. */
+		ASSERT(db->db_data_pending->dr_dbuf == db);
+		/* The pending DR should be on the list. */
+		ASSERT(pending == db->db_data_pending);
+	}
 
 	/*
 	 * We can't assert that db_size matches dn_datablksz because it
@@ -499,6 +519,17 @@ dbuf_verify(dmu_buf_impl_t *db)
 }
 #endif
 
+static arc_buf_t *
+dbuf_alloc_arcbuf(dmu_buf_impl_t *db)
+{
+	spa_t *spa = db->db_objset->os_spa;
+	arc_buf_t *buf;
+
+	buf = arc_buf_alloc(spa, db->db.db_size, db, DBUF_GET_BUFC_TYPE(db));
+	buf->b_last_dbuf = db;
+	return (buf);
+}
+
 static void
 dbuf_clear_data(dmu_buf_impl_t *db)
 {
@@ -507,9 +538,13 @@ dbuf_clear_data(dmu_buf_impl_t *db)
 	db->db_buf = NULL;
 	db->db.db_data = NULL;
 	if (db->db_state != DB_NOFILL)
-		db->db_state = DB_UNCACHED;
+		DBUF_STATE_CHANGE(db, =, DB_UNCACHED, "clear data");
 }
 
+/*
+ * Set the dbuf's buffer to the ARC buffer, including any associated state,
+ * such as db_data.
+ */
 static void
 dbuf_set_data(dmu_buf_impl_t *db, arc_buf_t *buf)
 {
@@ -517,10 +552,21 @@ dbuf_set_data(dmu_buf_impl_t *db, arc_buf_t *buf)
 	ASSERT(buf != NULL);
 
 	db->db_buf = buf;
+	db->db_buf->b_last_dbuf = db;
 	ASSERT(buf->b_data != NULL);
 	db->db.db_data = buf->b_data;
 	if (!arc_released(buf))
 		arc_set_callback(buf, dbuf_do_evict, db);
+}
+
+static arc_buf_t *
+dbuf_clone_arcbuf(dmu_buf_impl_t *db)
+{
+	arc_buf_t *buf;
+
+	buf = dbuf_alloc_arcbuf(db);
+	bcopy(db->db.db_data, buf->b_data, db->db.db_size);
+	return (buf);
 }
 
 /*
@@ -583,6 +629,95 @@ dbuf_whichblock(dnode_t *dn, int64_t level, uint64_t offset)
 	}
 }
 
+/*
+ * Perform any dbuf arc buffer splits required to guarantee
+ * the syncer operates on a stable buffer.  The buffer is provided
+ * through its dirty record, syncer_dr.  If this operation is
+ * occurring after a resolving read, deferred_split must be TRUE.
+ *
+ * If the syncer's buffer is currently "in use" in the
+ * open transaction group (i.e., there are active holds
+ * and db_data still references it), then make a copy
+ * before we start the write, so that any modifications
+ * from the open txg will not leak into this write.
+ *
+ * NOTE: This copy does not need to be made for objects only modified
+ * in the syncing context (e.g. DNODE_DNODE blocks).
+ */
+static void
+dbuf_syncer_split(dmu_buf_impl_t *db, dbuf_dirty_record_t *syncer_dr,
+    boolean_t deferred_split)
+{
+	if (syncer_dr && (db->db_state & DB_NOFILL) == 0 &&
+	    refcount_count(&db->db_holds) > 1 &&
+	    syncer_dr->dt.dl.dr_data == db->db_buf) {
+		arc_buf_t *buf;
+
+		buf = dbuf_clone_arcbuf(db);
+		if (deferred_split) {
+			/*
+			 * In the case of a deferred split, the
+			 * syncer has already generated a zio that
+			 * references the syncer's arc buffer.
+			 * Replace the open txg buffer instead.
+			 * No activity in the open txg can be
+			 * occurring yet.  A reader is waiting
+			 * for the resolve to complete, and a
+			 * writer hasn't gotten around to creating
+			 * a dirty record.  Otherwise this dbuf
+			 * would already have been split.
+			 */
+			dbuf_set_data(db, buf);
+		} else {
+			/*
+			 * The syncer has yet to create a write
+			 * zio and since the dbuf may be in the
+			 * CACHED state, activity in the open
+			 * txg may be occurring.  Switch out
+			 * the syncer's dbuf, since it can tolerate
+			 * the change.
+			 */
+			syncer_dr->dt.dl.dr_data = buf;
+		}
+	}
+}
+
+/*
+ * This function is a port from async COW fault resolution; it includes
+ * additional logic in that scenario.
+ */
+static void
+dbuf_read_complete(dmu_buf_impl_t *db, arc_buf_t *buf)
+{
+	dbuf_dirty_record_t *oldest_dr = list_tail(&db->db_dirty_records);
+
+	if (db->db_state == DB_READ) {
+		/*
+		 * Read with no dirty data.  Use the buffer we
+		 * read and transition to DB_CACHED.
+		 */
+		dbuf_set_data(db, buf);
+		DBUF_STATE_CHANGE(db, =, DB_CACHED,
+		    "read completed with no dirty records");
+	} else {
+		/*
+		 * The block was filled or freed before the read completed.
+		 * If it was filled, it is either CACHED or FILL.  If it was
+		 * freed, it is CACHED and is already zero filled.
+		 */
+		ASSERT(db->db_state == DB_CACHED || db->db_state == DB_FILL);
+		/*
+		 * The filler may still be running, but it can only have one
+		 * dirty record; otherwise, a resolve must occur.
+		 */
+		ASSERT(db->db_state != DB_FILL || db->db_dirtycnt == 1);
+
+		/* Regardless, the frontend must already be populated. */
+		ASSERT(db->db_buf != NULL);
+		arc_discard_buf(buf, db);
+	}
+}
+
 static void
 dbuf_read_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 {
@@ -596,27 +731,95 @@ dbuf_read_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 	ASSERT(refcount_count(&db->db_holds) > 0);
 	ASSERT(db->db_buf == NULL);
 	ASSERT(db->db.db_data == NULL);
-	if (db->db_level == 0 && db->db_freed_in_flight) {
-		/* we were freed in flight; disregard any error */
-		arc_release(buf, db);
-		bzero(buf->b_data, db->db.db_size);
-		arc_buf_freeze(buf);
-		db->db_freed_in_flight = FALSE;
-		dbuf_set_data(db, buf);
-		db->db_state = DB_CACHED;
-	} else if (zio == NULL || zio->io_error == 0) {
-		dbuf_set_data(db, buf);
-		db->db_state = DB_CACHED;
+	if (zio == NULL || zio->io_error == 0) {
+		/* Read succeeded. */
+		dbuf_read_complete(db, buf);
 	} else {
+		/* Read failed. */
 		ASSERT(db->db_blkid != DMU_BONUS_BLKID);
 		ASSERT3P(db->db_buf, ==, NULL);
 		VERIFY(arc_buf_remove_ref(buf, db));
-		db->db_state = DB_UNCACHED;
+		DBUF_STATE_CHANGE(db, =, DB_UNCACHED, "read failed");
 	}
 	cv_broadcast(&db->db_changed);
 	dbuf_rele_and_unlock(db, NULL);
 }
 
+/*
+ * Shortcut for performing reads on bonus dbufs.  Returns whether any action
+ * was taken.
+ */
+static boolean_t
+dbuf_read_bonus(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
+{
+	int bonuslen = MIN(dn->dn_bonuslen, dn->dn_phys->dn_bonuslen);
+
+	if (db->db_blkid != DMU_BONUS_BLKID)
+		return (B_FALSE);
+
+	ASSERT3U(bonuslen, <=, db->db.db_size);
+	db->db.db_data = zio_buf_alloc(DN_MAX_BONUSLEN);
+	arc_space_consumer(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
+	if (bonuslen < DN_MAX_BONUSLEN)
+		bzero(db->db.db_data, DN_MAX_BONUSLEN);
+	if (bonuslen != 0)
+		bcopy(DN_BONUS(dn->dn_phys), db->db.db_data, bonuslen);
+	DBUF_STATE_CHANGE(db, =, DB_CACHED, "bonus buffer filled");
+	return (B_TRUE);
+}
+
+/*
+ * Handle reads on dbufs that are holes, if necessary.  This function
+ * requires that the dbuf's mutex is held, and if it performs any action, it
+ * drops the mutex.  Returns whether any action was taken.
+ */
+static boolean_t
+dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
+{
+	int is_hole;
+
+	ASSERT(MUTEX_HELD(&db->db_mtx));
+
+	/*
+	 * If the dbuf isn't UNCACHED, then presumably the caller is trying
+	 * to perform a resolving read.
+	 */
+	if (db->db_state != DB_UNCACHED) {
+		ASSERT(db->db_level == 0);
+		ASSERT(db->db_state & (DB_PARTIAL|DB_FILL|DB_READ));
+		ASSERT(db->db_dirtycnt > 0);
+		return (B_FALSE);
+	}
+
+	is_hole = db->db_blkptr == NULL || BP_IS_HOLE(db->db_blkptr);
+	/*
+	 * For level 0 blocks only, if the above check fails:
+	 * Recheck BP_IS_HOLE() after dnode_block_freed() in case dnode_sync()
+	 * processes the delete record and clears the bp while we are waiting
+	 * for the dn_mtx (resulting in a "no" from block_freed).
+	 */
+	if (!is_hole && db->db_level == 0)
+		is_hole = dnode_block_freed(dn, db->db_blkid) ||
+		    BP_IS_HOLE(db->db_blkptr);
+
+	if (is_hole) {
+		arc_buf_t *buf;
+
+		buf = dbuf_alloc_arcbuf(db);
+		bzero(buf->b_data, db->db.db_size);
+		DBUF_STATE_CHANGE(db, =, DB_READ, "hole read satisfied");
+		dbuf_read_complete(db, buf, /*is_hole_read*/B_TRUE);
+		return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
+ * Actually read (or issue I/O for) a dbuf's block.
+ *
+ * Flags will be modified to include DB_RF_CACHED if the call returns with
+ * the dbuf cached.
+ */
 static void
 dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 {
@@ -633,44 +836,15 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 	ASSERT(db->db_state == DB_UNCACHED);
 	ASSERT(db->db_buf == NULL);
 
-	if (db->db_blkid == DMU_BONUS_BLKID) {
-		int bonuslen = MIN(dn->dn_bonuslen, dn->dn_phys->dn_bonuslen);
-
-		ASSERT3U(bonuslen, <=, db->db.db_size);
-		db->db.db_data = zio_buf_alloc(DN_MAX_BONUSLEN);
-		arc_space_consume(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
-		if (bonuslen < DN_MAX_BONUSLEN)
-			bzero(db->db.db_data, DN_MAX_BONUSLEN);
-		if (bonuslen)
-			bcopy(DN_BONUS(dn->dn_phys), db->db.db_data, bonuslen);
+	if (dbuf_read_bonus(db, dn, flags) || dbuf_read_hole(db, dn, flags)) {
 		DB_DNODE_EXIT(db);
-		db->db_state = DB_CACHED;
-		mutex_exit(&db->db_mtx);
-		return;
-	}
-
-	/*
-	 * Recheck BP_IS_HOLE() after dnode_block_freed() in case dnode_sync()
-	 * processes the delete record and clears the bp while we are waiting
-	 * for the dn_mtx (resulting in a "no" from block_freed).
-	 */
-	if (db->db_blkptr == NULL || BP_IS_HOLE(db->db_blkptr) ||
-	    (db->db_level == 0 && (dnode_block_freed(dn, db->db_blkid) ||
-	    BP_IS_HOLE(db->db_blkptr)))) {
-		arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
-
-		DB_DNODE_EXIT(db);
-		dbuf_set_data(db, arc_buf_alloc(db->db_objset->os_spa,
-		    db->db.db_size, db, type));
-		bzero(db->db.db_data, db->db.db_size);
-		db->db_state = DB_CACHED;
-		mutex_exit(&db->db_mtx);
+		*flags |= DB_RF_CACHED;
 		return;
 	}
 
 	DB_DNODE_EXIT(db);
 
-	db->db_state = DB_READ;
+	DBUF_STATE_CHANGE(db, =, DB_READ, "read issued");
 	mutex_exit(&db->db_mtx);
 
 	if (DBUF_IS_L2CACHEABLE(db))
@@ -759,10 +933,9 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		DB_DNODE_EXIT(db);
 
 		/* Skip the wait per the caller's request. */
-		mutex_enter(&db->db_mtx);
 		if ((flags & DB_RF_NEVERWAIT) == 0) {
-			while (db->db_state == DB_READ ||
-			    db->db_state == DB_FILL) {
+			mutex_enter(&db->db_mtx);
+			while (db->db_state & (DB_READ|DB_FILL)) {
 				ASSERT(db->db_state == DB_READ ||
 				    (flags & DB_RF_HAVESTRUCT) == 0);
 				DTRACE_PROBE2(blocked__read, dmu_buf_impl_t *,
@@ -771,91 +944,20 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 			}
 			if (db->db_state == DB_UNCACHED)
 				err = SET_ERROR(EIO);
+			mutex_exit(&db->db_mtx);
 		}
-		mutex_exit(&db->db_mtx);
 	}
 
 	ASSERT(err || havepzio || db->db_state == DB_CACHED);
 	return (err);
 }
 
-static void
-dbuf_noread(dmu_buf_impl_t *db)
-{
-	ASSERT(!refcount_is_zero(&db->db_holds));
-	ASSERT(db->db_blkid != DMU_BONUS_BLKID);
-	mutex_enter(&db->db_mtx);
-	while (db->db_state == DB_READ || db->db_state == DB_FILL)
-		cv_wait(&db->db_changed, &db->db_mtx);
-	if (db->db_state == DB_UNCACHED) {
-		arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
-		spa_t *spa = db->db_objset->os_spa;
-
-		ASSERT(db->db_buf == NULL);
-		ASSERT(db->db.db_data == NULL);
-		dbuf_set_data(db, arc_buf_alloc(spa, db->db.db_size, db, type));
-		db->db_state = DB_FILL;
-	} else if (db->db_state == DB_NOFILL) {
-		dbuf_clear_data(db);
-	} else {
-		ASSERT3U(db->db_state, ==, DB_CACHED);
-	}
-	mutex_exit(&db->db_mtx);
-}
-
 /*
- * This is our just-in-time copy function.  It makes a copy of
- * buffers, that have been modified in a previous transaction
- * group, before we modify them in the current active group.
+ * Signal that the dirty record is about to be re-dirtied after sync.
  *
- * This function is used in two places: when we are dirtying a
- * buffer for the first time in a txg, and when we are freeing
- * a range in a dnode that includes this buffer.
- *
- * Note that when we are called from dbuf_free_range() we do
- * not put a hold on the buffer, we just traverse the active
- * dbuf list for the dnode.
+ * This function is used to notify, if necessary, that a dbuf is about
+ * to be dirtied again after having an immediate write via dmu_sync().
  */
-static void
-dbuf_fix_old_data(dmu_buf_impl_t *db, uint64_t txg)
-{
-	dbuf_dirty_record_t *dr = db->db_last_dirty;
-
-	ASSERT(MUTEX_HELD(&db->db_mtx));
-	ASSERT(db->db.db_data != NULL);
-	ASSERT(db->db_level == 0);
-	ASSERT(db->db.db_object != DMU_META_DNODE_OBJECT);
-
-	if (dr == NULL ||
-	    (dr->dt.dl.dr_data !=
-	    ((db->db_blkid  == DMU_BONUS_BLKID) ? db->db.db_data : db->db_buf)))
-		return;
-
-	/*
-	 * If the last dirty record for this dbuf has not yet synced
-	 * and its referencing the dbuf data, either:
-	 *	reset the reference to point to a new copy,
-	 * or (if there a no active holders)
-	 *	just null out the current db_data pointer.
-	 */
-	ASSERT(dr->dr_txg >= txg - 2);
-	if (db->db_blkid == DMU_BONUS_BLKID) {
-		/* Note that the data bufs here are zio_bufs */
-		dr->dt.dl.dr_data = zio_buf_alloc(DN_MAX_BONUSLEN);
-		arc_space_consume(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
-		bcopy(db->db.db_data, dr->dt.dl.dr_data, DN_MAX_BONUSLEN);
-	} else if (refcount_count(&db->db_holds) > db->db_dirtycnt) {
-		int size = db->db.db_size;
-		arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
-		spa_t *spa = db->db_objset->os_spa;
-
-		dr->dt.dl.dr_data = arc_buf_alloc(spa, size, db, type);
-		bcopy(db->db.db_data, dr->dt.dl.dr_data->b_data, size);
-	} else {
-		dbuf_clear_data(db);
-	}
-}
-
 void
 dbuf_unoverride(dbuf_dirty_record_t *dr)
 {
@@ -864,6 +966,11 @@ dbuf_unoverride(dbuf_dirty_record_t *dr)
 	uint64_t txg = dr->dr_txg;
 
 	ASSERT(MUTEX_HELD(&db->db_mtx));
+	/*
+	 * This assert is valid because dmu_sync() expects to be called by
+	 * a zilog's get_data while holding a range lock.  This call only
+	 * comes from dbuf_dirty() callers who must also hold a range lock.
+	 */
 	ASSERT(dr->dt.dl.dr_override_state != DR_IN_DMU_SYNC);
 	ASSERT(db->db_level == 0);
 
@@ -891,7 +998,127 @@ dbuf_unoverride(dbuf_dirty_record_t *dr)
 	arc_release(dr->dt.dl.dr_data, db);
 }
 
+static void
+dbuf_free_range_disassociate_frontend(dmu_buf_impl_t *db, dnode_t *dn,
+    dmu_tx_t *tx)
+{
+	dbuf_dirty_record_t *dr;
+
+	dr = list_head(&db->db_dirty_records);
+	tmpprintf("%s db %p dr %p holds %lu dirties %d txg %llu\n",
+	    __func__, db, dr, refcount_count(&db->db_holds),
+	    db->db_dirtycnt, tx->tx_txg);
+
+	if (dr == NULL)
+		return;
+
+	if (dr->dr_txg == tx->tx_txg) {
+		/*
+		 * This buffer is "in-use", re-adjust the file size to reflect
+		 * that this buffer may contain new data when we sync.
+		 */
+		if (db->db_blkid != DMU_SPILL_BLKID &&
+		    db->db_blkid > dn->dn_maxblkid)
+			dn->dn_maxblkid = db->db_blkid;
+		/* Handle intermediate dmu_sync() calls. */
+		dbuf_unoverride(dr);
+	} else {
+		/* Disassociate the frontend if necessary. */
+		if (dr->dt.dl.dr_data == db->db_buf) {
+			arc_buf_t *buf;
+
+			buf = dbuf_alloc_arcbuf(db);
+			if (refcount_count(&db->db_holds) > db->db_dirtycnt) {
+
+				/*
+				 * Frontend being referenced by a user, but
+				 * this dirty record has yet to be processed
+				 * by the syncer.
+				 */
+				ASSERT(dr != db->db_data_pending);
+				if (db->db_state & DB_READ) {
+					/*
+					 * The reader has yet to access the
+					 * frontend (it must wait for the
+					 * READ->CACHED transition), so it
+					 * is safe to replace the frontend.
+					 */
+					dbuf_set_data(db, buf);
+				} else {
+					/*
+					 * A reader is accessing the frontend,
+					 * so we cannot replace it.
+					 * Disassociate by replacing the
+					 * buffer used for future syncer
+					 * operations.
+					 */
+					bcopy(db->db.db_data, buf->b_data,
+					    db->db.db_size);
+				}
+			} else {
+				/*
+				 * Foreground is currently unreferenced, but
+				 * a future access that results in a READ
+				 * will confuse in-progress resolution of
+				 * dirty records for older transactions.
+				 * Provide a buffer so any future consumers
+				 * will see a dbuf in the CACHED state.
+				 */
+				dbuf_set_data(db, buf);
+			}
+		}
+	}
+}
+
+static boolean_t
+dbuf_free_range_already_freed(dmu_buf_impl_t *db)
+{
+	/* XXX add comment about why these are OK */
+	if (db->db_state == DB_CACHED || db->db_state == DB_NOFILL ||
+	    db->db_state == DB_EVICTING) {
+		ASSERT(db->db.db_data == NULL);
+		mutex_exit(&db->db_mtx);
+		return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+static boolean_t
+dbuf_free_range_filler_will_free(dmu_buf_impl_t *db)
+{
+	if (db->db_state & DB_FILL) {
+		/*
+		 * If the buffer is currently being filled, then its
+		 * contents cannot be directly cleared.  Signal the filler
+		 * to have dbuf_fill_done perform the clear just before
+		 * transitioning the buffer to the CACHED state.
+		 */
+		db->db_freed_in_flight = TRUE;
+		mutex_exit(&db->db_mtx);
+		return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
 /*
+ * If a dbuf has no users, clear it.  Returns whether it was cleared.
+ */
+static boolean_t
+dbuf_clear_successful(dmu_buf_impl_t *db)
+{
+
+	if (refcount_count(&db->db_holds) == 0) {
+		/* All consumers are finished, so evict the buffer */
+		ASSERT(db->db_buf != NULL);
+		dbuf_clear(db);
+		return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
+ * Free a range of data blocks in a dnode.  The start and end are inclusive.
+ *
  * Evict (if its unreferenced) or clear (if its referenced) any level-0
  * data blocks in the free range, so that any future readers will find
  * empty blocks.
@@ -943,6 +1170,8 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 	db = avl_nearest(&dn->dn_dbufs, where, AVL_AFTER);
 
 	for (; db != NULL; db = db_next) {
+		dbuf_dirty_record_t *dr;
+
 		db_next = AVL_NEXT(&dn->dn_dbufs, db);
 		ASSERT(db->db_blkid != DMU_BONUS_BLKID);
 
@@ -958,57 +1187,31 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 			continue;
 		}
 
-		if (db->db_state == DB_UNCACHED ||
-		    db->db_state == DB_NOFILL ||
-		    db->db_state == DB_EVICTING) {
-			ASSERT(db->db.db_data == NULL);
-			mutex_exit(&db->db_mtx);
-			continue;
-		}
-		if (db->db_state == DB_READ || db->db_state == DB_FILL) {
-			/* will be handled in dbuf_read_done or dbuf_rele */
-			db->db_freed_in_flight = TRUE;
-			mutex_exit(&db->db_mtx);
-			continue;
-		}
-		if (refcount_count(&db->db_holds) == 0) {
-			ASSERT(db->db_buf);
-			dbuf_clear(db);
-			continue;
-		}
-		/* The dbuf is referenced */
+		dr = list_head(&db->db_dirty_records);
+		if (dr != NULL && dr->dr_txg != tx->tx_txg)
+			dr = NULL;
+		DBUF_VERIFY(db);
+		if (dbuf_free_range_already_freed(db) ||
+		    dbuf_free_range_filler_will_free(db) ||
+		    dbuf_clear_successful(db))
+			continue; /* db_mtx already exited */
 
-		if (db->db_last_dirty != NULL) {
-			dbuf_dirty_record_t *dr = db->db_last_dirty;
-
-			if (dr->dr_txg == txg) {
-				/*
-				 * This buffer is "in-use", re-adjust the file
-				 * size to reflect that this buffer may
-				 * contain new data when we sync.
-				 */
-				if (db->db_blkid != DMU_SPILL_BLKID &&
-				    db->db_blkid > dn->dn_maxblkid)
-					dn->dn_maxblkid = db->db_blkid;
-				dbuf_unoverride(dr);
-			} else {
-				/*
-				 * This dbuf is not dirty in the open context.
-				 * Either uncache it (if its not referenced in
-				 * the open context) or reset its contents to
-				 * empty.
-				 */
-				dbuf_fix_old_data(db, txg);
-			}
-		}
-		/* clear the contents if its cached */
-		if (db->db_state == DB_CACHED) {
-			ASSERT(db->db.db_data != NULL);
+		/*
+		 * The goal is to make the data that is visible in the current
+		 * transaction group all zeros, while preserving the data
+		 * as seen in any earlier transaction groups.
+		 */
+		dbuf_free_range_disassociate_frontend(db);
+		if (db->db_buf == NULL) {
+			ASSERT3U(db->db_state, ==, DB_READ);
+			dbuf_set_data(db, dbuf_alloc_arcbuf(db));
+		} else {
 			arc_release(db->db_buf, db);
-			bzero(db->db.db_data, db->db.db_size);
-			arc_buf_freeze(db->db_buf);
 		}
-
+		bzero(db->db.db_data, db->db.db_size);
+		arc_buf_freeze(db->db_buf);
+		DBUF_STATE_CHANGE(db, =, DB_CACHED, "zeroed by free");
+		cv_broadcast(&db->db_changed);
 		mutex_exit(&db->db_mtx);
 	}
 	mutex_exit(&dn->dn_dbufs_mtx);
@@ -1018,20 +1221,22 @@ static int
 dbuf_block_freeable(dmu_buf_impl_t *db)
 {
 	dsl_dataset_t *ds = db->db_objset->os_dsl_dataset;
+	dbuf_dirty_record_t *dr;
 	uint64_t birth_txg = 0;
 
 	/*
 	 * We don't need any locking to protect db_blkptr:
-	 * If it's syncing, then db_last_dirty will be set
-	 * so we'll ignore db_blkptr.
+	 * If it's syncing, then db_dirty_records will have
+	 * entries, so we'll ignore db_blkptr.
 	 *
 	 * This logic ensures that only block births for
 	 * filled blocks are considered.
 	 */
 	ASSERT(MUTEX_HELD(&db->db_mtx));
-	if (db->db_last_dirty && (db->db_blkptr == NULL ||
+	dr = list_head(&db->db_dirty_records);
+	if (dr != NULL && (db->db_blkptr == NULL ||
 	    !BP_IS_HOLE(db->db_blkptr))) {
-		birth_txg = db->db_last_dirty->dr_txg;
+		birth_txg = dr->dr_txg;
 	} else if (db->db_blkptr != NULL && !BP_IS_HOLE(db->db_blkptr)) {
 		birth_txg = db->db_blkptr->blk_birth;
 	}
@@ -1093,8 +1298,11 @@ dbuf_new_size(dmu_buf_impl_t *db, int size, dmu_tx_t *tx)
 	db->db.db_size = size;
 
 	if (db->db_level == 0) {
-		ASSERT3U(db->db_last_dirty->dr_txg, ==, tx->tx_txg);
-		db->db_last_dirty->dt.dl.dr_data = buf;
+		dbuf_dirty_record_t *dr;
+
+		dr = list_head(&db->db_dirty_records);
+		ASSERT3U(dr->dr_txg, ==, tx->tx_txg);
+		dr->dt.dl.dr_data = buf;
 	}
 	mutex_exit(&db->db_mtx);
 
@@ -1141,108 +1349,56 @@ dbuf_redirty(dbuf_dirty_record_t *dr)
 	}
 }
 
-dbuf_dirty_record_t *
-dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
+/*
+ * State of the current dirtying process.  Dirtying requires keeping a lot
+ * of state available, so using a struct to access it keeps the code sane.
+ */
+typedef struct dbuf_dirty_state {
+	dmu_buf_impl_t *db;		/* Dbuf being dirtied. */
+	dmu_tx_t *tx;			/* Transaction to dirty. */
+	dnode_t *dn;			/* The dbuf's dnode. */
+	dbuf_dirty_record_t *insert_pt;	/* DR to insert new DR after. */
+	dbuf_dirty_record_t *txg_dr;	/* Dirty record for this txg. */
+	boolean_t txg_already_dirty;	/* This txg already dirty? */
+	boolean_t do_free_accounting;	/* Free accounting needed? */
+
+	/* The below only apply to leaf blocks. */
+	arc_buf_t *fill_buf;		/* Already-filled optional buffer. */
+	int offset;			/* Offset of the upcoming write. */
+	int size;			/* Size of the upcoming write. */
+} dbuf_dirty_state_t;
+
+static void
+dbuf_new_dirty_record_accounting(dbuf_dirty_state_t *dds)
 {
-	dnode_t *dn;
-	objset_t *os;
-	dbuf_dirty_record_t **drp, *dr;
-	int drop_struct_lock = FALSE;
-	boolean_t do_free_accounting = B_FALSE;
-	int txgoff = tx->tx_txg & TXG_MASK;
-
-	ASSERT(tx->tx_txg != 0);
-	ASSERT(!refcount_is_zero(&db->db_holds));
-	DMU_TX_DIRTY_BUF(tx, db);
-
-	DB_DNODE_ENTER(db);
-	dn = DB_DNODE(db);
-	/*
-	 * Shouldn't dirty a regular buffer in syncing context.  Private
-	 * objects may be dirtied in syncing context, but only if they
-	 * were already pre-dirtied in open context.
-	 */
-	ASSERT(!dmu_tx_is_syncing(tx) ||
-	    BP_IS_HOLE(dn->dn_objset->os_rootbp) ||
-	    DMU_OBJECT_IS_SPECIAL(dn->dn_object) ||
-	    dn->dn_objset->os_dsl_dataset == NULL);
-	/*
-	 * We make this assert for private objects as well, but after we
-	 * check if we're already dirty.  They are allowed to re-dirty
-	 * in syncing context.
-	 */
-	ASSERT(dn->dn_object == DMU_META_DNODE_OBJECT ||
-	    dn->dn_dirtyctx == DN_UNDIRTIED || dn->dn_dirtyctx ==
-	    (dmu_tx_is_syncing(tx) ? DN_DIRTY_SYNC : DN_DIRTY_OPEN));
-
-	mutex_enter(&db->db_mtx);
-	/*
-	 * XXX make this true for indirects too?  The problem is that
-	 * transactions created with dmu_tx_create_assigned() from
-	 * syncing context don't bother holding ahead.
-	 */
-	ASSERT(db->db_level != 0 ||
-	    db->db_state == DB_CACHED || db->db_state == DB_FILL ||
-	    db->db_state == DB_NOFILL);
-
-	mutex_enter(&dn->dn_mtx);
-	/*
-	 * Don't set dirtyctx to SYNC if we're just modifying this as we
-	 * initialize the objset.
-	 */
-	if (dn->dn_dirtyctx == DN_UNDIRTIED &&
-	    !BP_IS_HOLE(dn->dn_objset->os_rootbp)) {
-		dn->dn_dirtyctx =
-		    (dmu_tx_is_syncing(tx) ? DN_DIRTY_SYNC : DN_DIRTY_OPEN);
-		ASSERT(dn->dn_dirtyctx_firstset == NULL);
-		dn->dn_dirtyctx_firstset = kmem_alloc(1, KM_SLEEP);
-	}
-	mutex_exit(&dn->dn_mtx);
-
-	if (db->db_blkid == DMU_SPILL_BLKID)
-		dn->dn_have_spill = B_TRUE;
+	dnode_t *dn = dds->dn;
+	dmu_tx_t *tx = dds->tx;
+	dmu_buf_impl_t *db = dds->db;
+	objset_t *os = dn->dn_objset;
 
 	/*
-	 * If this buffer is already dirty, we're done.
+	 * Only valid if not already dirty in this transaction group.
 	 */
-	drp = &db->db_last_dirty;
-	ASSERT(*drp == NULL || (*drp)->dr_txg <= tx->tx_txg ||
-	    db->db.db_object == DMU_META_DNODE_OBJECT);
-	while ((dr = *drp) != NULL && dr->dr_txg > tx->tx_txg)
-		drp = &dr->dr_next;
-	if (dr && dr->dr_txg == tx->tx_txg) {
-		DB_DNODE_EXIT(db);
-
-		dbuf_redirty(dr);
-		mutex_exit(&db->db_mtx);
-		return (dr);
-	}
-
-	/*
-	 * Only valid if not already dirty.
-	 */
-	ASSERT(dn->dn_object == 0 ||
-	    dn->dn_dirtyctx == DN_UNDIRTIED || dn->dn_dirtyctx ==
-	    (dmu_tx_is_syncing(tx) ? DN_DIRTY_SYNC : DN_DIRTY_OPEN));
+	DNODE_VERIFY_DIRTYCTX(dn, tx);
 
 	ASSERT3U(dn->dn_nlevels, >, db->db_level);
 	ASSERT((dn->dn_phys->dn_nlevels == 0 && db->db_level == 0) ||
 	    dn->dn_phys->dn_nlevels > db->db_level ||
-	    dn->dn_next_nlevels[txgoff] > db->db_level ||
-	    dn->dn_next_nlevels[(tx->tx_txg-1) & TXG_MASK] > db->db_level ||
-	    dn->dn_next_nlevels[(tx->tx_txg-2) & TXG_MASK] > db->db_level);
+	    DN_NEXT_LEVEL(dn, tx->tx_txg) > db->db_level ||
+	    DN_NEXT_LEVEL(dn, tx->tx_txg - 1) > db->db_level ||
+	    DN_NEXT_LEVEL(dn, tx->tx_txg - 2) > db->db_level);
 
 	/*
 	 * We should only be dirtying in syncing context if it's the
 	 * mos or we're initializing the os or it's a special object.
 	 * However, we are allowed to dirty in syncing context provided
-	 * we already dirtied it in open context.  Hence we must make
+	 * we already dirtied in open context.  Hence we must make
 	 * this assertion only if we're not already dirty.
 	 */
-	os = dn->dn_objset;
-	ASSERT(!dmu_tx_is_syncing(tx) || DMU_OBJECT_IS_SPECIAL(dn->dn_object) ||
+	ASSERT(!dmu_tx_is_syncing(tx) ||
+	    DMU_OBJECT_IS_SPECIAL(dn->dn_object) ||
 	    os->os_dsl_dataset == NULL || BP_IS_HOLE(os->os_rootbp));
-	ASSERT(db->db.db_size != 0);
+	ASSERT3U(db->db.db_size, !=, 0);
 
 	dprintf_dbuf(db, "size=%llx\n", (u_longlong_t)db->db.db_size);
 
@@ -1255,76 +1411,202 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 		 * also holding the db_mtx.
 		 */
 		dnode_willuse_space(dn, db->db.db_size, tx);
-		do_free_accounting = dbuf_block_freeable(db);
+		if (db->db_blkid != DMU_SPILL_BLKID)
+			dds->do_free_accounting = dbuf_block_freeable(db);
 	}
+}
 
-	/*
-	 * If this buffer is dirty in an old transaction group we need
-	 * to make a copy of it so that the changes we make in this
-	 * transaction group won't leak out when we sync the older txg.
-	 */
+static dbuf_dirty_record_t *
+dbuf_dirty_record_create(dbuf_dirty_state_t *dds)
+{
+	dbuf_dirty_record_t *dr;
+	dmu_buf_impl_t *db = dds->db;
+	objset_t *os = dds->dn->dn_objset;
+
+	ASSERT(MUTEX_HELD(&dds->db->db_mtx));
+	ASSERT(DB_DNODE_HELD(dds->db));
+	ASSERT((dr = list_head(&dds->db->db_dirty_records)) == NULL ||
+	    dr->dr_txg != dds->tx->tx_txg);
+
+	dbuf_new_dirty_record_accounting(dds);
+
+	ASSERT3P(dds->txg_dr, ==, NULL);
 	dr = kmem_zalloc(sizeof (dbuf_dirty_record_t), KM_SLEEP);
-	if (db->db_level == 0) {
-		void *data_old = db->db_buf;
-
-		if (db->db_state != DB_NOFILL) {
-			if (db->db_blkid == DMU_BONUS_BLKID) {
-				dbuf_fix_old_data(db, tx->tx_txg);
-				data_old = db->db.db_data;
-			} else if (db->db.db_object != DMU_META_DNODE_OBJECT) {
-				/*
-				 * Release the data buffer from the cache so
-				 * that we can modify it without impacting
-				 * possible other users of this cached data
-				 * block.  Note that indirect blocks and
-				 * private objects are not released until the
-				 * syncing state (since they are only modified
-				 * then).
-				 */
-				arc_release(db->db_buf, db);
-				dbuf_fix_old_data(db, tx->tx_txg);
-				data_old = db->db_buf;
-			}
-			ASSERT(data_old != NULL);
-		}
-		dr->dt.dl.dr_data = data_old;
-	} else {
-		mutex_init(&dr->dt.di.dr_mtx, NULL, MUTEX_DEFAULT, NULL);
-		list_create(&dr->dt.di.dr_children,
-		    sizeof (dbuf_dirty_record_t),
-		    offsetof(dbuf_dirty_record_t, dr_dirty_node));
-	}
 	if (db->db_blkid != DMU_BONUS_BLKID && os->os_dsl_dataset != NULL)
 		dr->dr_accounted = db->db.db_size;
-	dr->dr_dbuf = db;
-	dr->dr_txg = tx->tx_txg;
-	dr->dr_next = *drp;
-	*drp = dr;
+	dr->dr_dbuf = dds->db;
+	dr->dr_txg = dds->tx->tx_txg;
+	dds->txg_dr = dr;
+
+	return (dr);
+}
+
+static void
+dbuf_dirty_record_register(dbuf_dirty_state_t *dds)
+{
+	ASSERT3P(dds->txg_dr, !=, NULL);
+	list_insert_after(&dds->db->db_dirty_records, dds->insert_pt,
+	    dds->txg_dr);
+
+	/* This buffer is now part of this txg */
+	dbuf_add_ref(dds->db, (void *)(uintptr_t)dds->tx->tx_txg);
+	dds->db->db_dirtycnt += 1;
+	ASSERT3U(dds->db->db_dirtycnt, <=, TXG_CONCURRENT_STATES);
+}
+
+static void
+dbuf_dirty_record_create_indirect(dbuf_dirty_state_t *dds)
+{
+	dbuf_dirty_record_t *dr;
+
+	dr = dbuf_dirty_record_create(dds);
+	mutex_init(&dr->dt.di.dr_mtx, NULL, MUTEX_DEFAULT, NULL);
+	list_create(&dr->dt.di.dr_children,
+	    sizeof (dbuf_dirty_record_t),
+	    offsetof(dbuf_dirty_record_t, dr_dirty_node));
+	dbuf_dirty_record_register(dds);
+}
+
+static void
+dbuf_dirty_record_update_leaf(dbuf_dirty_state_t *dds)
+{
+	if (dds->db->db_blkid == DMU_BONUS_BLKID)
+		dds->txg_dr->dt.dl.dr_data = dds->db->db.db_data;
+	else
+		dds->txg_dr->dt.dl.dr_data = dds->db->db_buf;
+}
+
+static void
+dbuf_dirty_record_register_as_leaf(dbuf_dirty_state_t *dds)
+{
+	dbuf_dirty_record_t *dr = dds->txg_dr;
+	dmu_buf_impl_t *db = dds->db;
+
+	dbuf_dirty_record_update_leaf(dds);
+	dprintf_dbuf(db, "%s: dr_data=%p\n", __func__, dr->dt.dl.dr_data);
+	list_create(&dr->dt.dl.write_ranges, sizeof (dbuf_dirty_range_t),
+	    offsetof(dbuf_dirty_range_t, write_range_link));
+	dbuf_dirty_record_register(dds);
+}
+
+static void
+dbuf_dirty_record_create_nofill(dbuf_dirty_state_t *dds)
+{
+	dbuf_dirty_record_t *dr;
+
+	(void) dbuf_dirty_record_create(dds);
+	dbuf_dirty_record_register_as_leaf(dds);
+}
+
+static void
+dbuf_dirty_verify(dmu_buf_impl_t *db, dmu_tx_t *tx)
+{
+#ifdef ZFS_DEBUG
+	dnode_t *dn = DB_DNODE(db);
+	dbuf_dirty_record_t *dr;
+
+	/* Ensure that this dbuf has a transaction group and a hold */
+	ASSERT3U(tx->tx_txg, !=, 0);
+	ASSERT(!refcount_is_zero(&db->db_holds));
+	DMU_TX_VERIFY_DIRTY_BUF(tx, db);
+
+	dr = list_head(&db->db_dirty_records);
+	ASSERT(dr == NULL || dr->dr_txg <= tx->tx_txg ||
+	    db->db.db_object == DMU_META_DNODE_OBJECT);
 
 	/*
-	 * We could have been freed_in_flight between the dbuf_noread
-	 * and dbuf_dirty.  We win, as though the dbuf_noread() had
-	 * happened after the free.
+	 * Shouldn't dirty a regular buffer in syncing context.  Private
+	 * objects may be dirtied in syncing context, but only if they
+	 * were already pre-dirtied in open context.
 	 */
-	if (db->db_level == 0 && db->db_blkid != DMU_BONUS_BLKID &&
-	    db->db_blkid != DMU_SPILL_BLKID) {
-		mutex_enter(&dn->dn_mtx);
-		if (dn->dn_free_ranges[txgoff] != NULL) {
-			range_tree_clear(dn->dn_free_ranges[txgoff],
-			    db->db_blkid, 1);
-		}
-		mutex_exit(&dn->dn_mtx);
-		db->db_freed_in_flight = FALSE;
+	ASSERT(!dmu_tx_is_syncing(tx) ||
+	    BP_IS_HOLE(dn->dn_objset->os_rootbp) ||
+	    DMU_OBJECT_IS_SPECIAL(dn->dn_object) ||
+	    dn->dn_objset->os_dsl_dataset == NULL);
+
+	DNODE_VERIFY_DIRTYCTX(dn, tx);
+#endif
+}
+
+/*
+ * Enter a dbuf-dirtying function.  This function should only be called once
+ * per dirty.
+ *
+ * This function's primary purpose is to compute state that only needs to be
+ * computed once per dirty call.  Call dbuf_dirty_compute_state if the
+ * function drops the mutex, for things that require re-computing.
+ */
+static void
+dbuf_dirty_enter(dbuf_dirty_state_t *dds, dmu_buf_impl_t *db, dmu_tx_t *tx)
+{
+	dbuf_dirty_record_t *dr;
+
+	memset(dds, 0, sizeof (*dds));
+	dds->db = db;
+	dds->tx = tx;
+
+	DB_DNODE_ENTER(db);
+	dds->dn = DB_DNODE(db);
+
+	mutex_enter(&db->db_mtx);
+}
+
+/*
+ * Compute the current dbuf dirty state.  The dbuf mutex must be held before
+ * this function is called, and afterwards, must not be dropped except by
+ * dbuf_dirty_exit().  If this is not possible, the intention was to allow a
+ * dbuf_dirty function to re-invoke this function after an action that might
+ * drop the mutex, and before continuing.  Additional work may be needed.
+ */
+static void
+dbuf_dirty_compute_state(dbuf_dirty_state_t *dds)
+{
+	dmu_buf_impl_t *db = dds->db;
+	dmu_tx_t *tx = dds->tx;
+	dbuf_dirty_record_t *dr, *newest;
+
+	/* Only one filler allowed at a time. */
+	while (db->db_state & DB_FILL) {
+		ASSERT0(db->db_level);
+		cv_wait(&db->db_changed, &db->db_mtx);
 	}
 
-	/*
-	 * This buffer is now part of this txg
-	 */
-	dbuf_add_ref(db, (void *)(uintptr_t)tx->tx_txg);
-	db->db_dirtycnt += 1;
-	ASSERT3U(db->db_dirtycnt, <=, 3);
+	dbuf_dirty_verify(db, tx);
+	if (db->db_blkid == DMU_SPILL_BLKID)
+		dds->dn->dn_have_spill = B_TRUE;
+	dnode_set_dirtyctx(dds->dn, tx, db);
 
-	mutex_exit(&db->db_mtx);
+	newest = list_head(&db->db_dirty_records);
+
+	/* Only the mdn object may dirty an older txg. */
+	ASSERT(newest == NULL || newest->dr_txg <= tx->tx_txg ||
+	    db->db.db_object == DMU_META_DNODE_OBJECT);
+
+	dds->insert_pt = NULL; /* Insert at head. */
+	for (dr = newest; dr != NULL && dr->dr_txg > tx->tx_txg;
+	    dr = list_next(&db->db_dirty_records, dr))
+		dds->insert_pt = dr;
+
+	if (dr != NULL && dr->dr_txg == tx->tx_txg)
+		dds->txg_dr = dr;
+
+	/*
+	 * Cache whether this TX already has a dirty record, so that upon exit,
+	 * additional work can be done after dropping the dbuf mutex.  This
+	 * information is useful elsewhere, too.
+	 */
+	dds->txg_already_dirty = (dds->txg_dr != NULL);
+}
+
+static void
+dbuf_dirty_parent(dbuf_dirty_state_t *dds)
+{
+	dnode_t *dn = dds->dn;
+	dmu_buf_impl_t *db = dds->db;
+	dmu_tx_t *tx = dds->tx;
+	dbuf_dirty_record_t *dr = dds->txg_dr;
+	boolean_t drop_struct_lock = B_FALSE;
+	int txgoff = tx->tx_txg & TXG_MASK;
 
 	if (db->db_blkid == DMU_BONUS_BLKID ||
 	    db->db_blkid == DMU_SPILL_BLKID) {
@@ -1333,27 +1615,12 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 		list_insert_tail(&dn->dn_dirty_records[txgoff], dr);
 		mutex_exit(&dn->dn_mtx);
 		dnode_setdirty(dn, tx);
-		DB_DNODE_EXIT(db);
-		return (dr);
-	} else if (do_free_accounting) {
-		blkptr_t *bp = db->db_blkptr;
-		int64_t willfree = (bp && !BP_IS_HOLE(bp)) ?
-		    bp_get_dsize(os->os_spa, bp) : db->db.db_size;
-		/*
-		 * This is only a guess -- if the dbuf is dirty
-		 * in a previous txg, we don't know how much
-		 * space it will use on disk yet.  We should
-		 * really have the struct_rwlock to access
-		 * db_blkptr, but since this is just a guess,
-		 * it's OK if we get an odd answer.
-		 */
-		ddt_prefetch(os->os_spa, bp);
-		dnode_willuse_space(dn, -willfree, tx);
+		return;
 	}
 
 	if (!RW_WRITE_HELD(&dn->dn_struct_rwlock)) {
 		rw_enter(&dn->dn_struct_rwlock, RW_READER);
-		drop_struct_lock = TRUE;
+		drop_struct_lock = B_TRUE;
 	}
 
 	if (db->db_level == 0) {
@@ -1362,55 +1629,644 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	}
 
 	if (db->db_level+1 < dn->dn_nlevels) {
+		/* The dbuf's parent is an indirect block */
 		dmu_buf_impl_t *parent = db->db_parent;
 		dbuf_dirty_record_t *di;
-		int parent_held = FALSE;
+		boolean_t parent_held = B_FALSE;
 
+		/* Get a hold on the parent before dropping struct_rwlock */
 		if (db->db_parent == NULL || db->db_parent == dn->dn_dbuf) {
 			int epbs = dn->dn_indblkshift - SPA_BLKPTRSHIFT;
 
 			parent = dbuf_hold_level(dn, db->db_level+1,
 			    db->db_blkid >> epbs, FTAG);
-			ASSERT(parent != NULL);
-			parent_held = TRUE;
+			ASSERT3P(parent, !=, NULL);
+			parent_held = B_TRUE;
 		}
 		if (drop_struct_lock)
 			rw_exit(&dn->dn_struct_rwlock);
+
 		ASSERT3U(db->db_level+1, ==, parent->db_level);
-		di = dbuf_dirty(parent, tx);
+		di = dbuf_dirty_indirect(parent, tx);
 		if (parent_held)
 			dbuf_rele(parent, FTAG);
 
+		/*
+		 * Update the dirty record to add this dbuf to its parent's
+		 * dirty record's list of dirty children.  The indirect
+		 * mutex could be conditionally acquired, but doing so is
+		 * unlikely to save any effort in most cases.  Acquiring it
+		 * unconditionally keeps this path clean of apparent LORs.
+		 */
+		mutex_enter(&di->dt.di.dr_mtx);
 		mutex_enter(&db->db_mtx);
 		/*
 		 * Since we've dropped the mutex, it's possible that
 		 * dbuf_undirty() might have changed this out from under us.
 		 */
-		if (db->db_last_dirty == dr ||
+		if (list_head(&db->db_dirty_records) == dr ||
 		    dn->dn_object == DMU_META_DNODE_OBJECT) {
-			mutex_enter(&di->dt.di.dr_mtx);
 			ASSERT3U(di->dr_txg, ==, tx->tx_txg);
 			ASSERT(!list_link_active(&dr->dr_dirty_node));
 			list_insert_tail(&di->dt.di.dr_children, dr);
-			mutex_exit(&di->dt.di.dr_mtx);
 			dr->dr_parent = di;
 		}
 		mutex_exit(&db->db_mtx);
+		mutex_exit(&di->dt.di.dr_mtx);
 	} else {
+		/* The dbuf's parent is the dnode */
 		ASSERT(db->db_level+1 == dn->dn_nlevels);
 		ASSERT(db->db_blkid < dn->dn_nblkptr);
 		ASSERT(db->db_parent == NULL || db->db_parent == dn->dn_dbuf);
+		/*
+		 * Update the dnode's list of dirty records to include this
+		 * dbuf's dirty record.
+		 */
 		mutex_enter(&dn->dn_mtx);
 		ASSERT(!list_link_active(&dr->dr_dirty_node));
 		list_insert_tail(&dn->dn_dirty_records[txgoff], dr);
 		mutex_exit(&dn->dn_mtx);
-		if (drop_struct_lock)
+		if (drop_struct_rwlock)
 			rw_exit(&dn->dn_struct_rwlock);
 	}
-
 	dnode_setdirty(dn, tx);
+}
+
+/*
+ * Exit a dbuf-dirtying function.  See dbuf_dirty.  The primary purpose is
+ * to verify a consistent state upon completing a dirty operation, then drop
+ * the mutex and dirty parent dbufs.
+ *
+ * It is also a good time to update free accounting.
+ *
+ * NOTE: This should only be called once in a dirtying function.
+ */
+static void
+dbuf_dirty_exit(dbuf_dirty_state_t *dds)
+{
+	dmu_buf_impl_t *db = dds->db;
+	void *front = (db->db_blkid == DMU_BONUS_BLKID) ? db->db.db_data :
+	    db->db_buf;
+
+	ASSERT(db->db_level != 0 || dds->txg_dr->dt.dl.dr_data == front);
+	ASSERT3U(dds->txg_dr, ==, dds->tx->tx_txg);
+
+	mutex_exit(&db->db_mtx);
+
+	if (!dds->txg_already_dirty) {
+		if (dds->do_free_accounting) {
+			/* NB: This only applies to non-SPILL/BONUS blocks. */
+			blkptr_t *bp = db->db_blkptr;
+			objset_t *os = dds->dn->dn_objset;
+			int64_t willfree = (bp && !BP_IS_HOLE(bp)) ?
+			    bp_get_dsize(os->os_spa, bp) : db->db.db_size;
+			/*
+			 * This is only a guess -- if the dbuf is dirty
+			 * in a previous txg, we don't know how much
+			 * space it will use on disk yet.  We should
+			 * really have the struct_rwlock to access
+			 * db_blkptr, but since this is just a guess,
+			 * it's OK if we get an odd answer.
+			 */
+			ddt_prefetch(os->os_spa, bp);
+			dnode_willuse_space(dds->dn, -willfree, dds->tx);
+		}
+		dbuf_dirty_parent(dds);
+	}
+
 	DB_DNODE_EXIT(db);
+}
+
+/*
+ * Dirty a nofill block.  See dbuf_dirty.
+ *
+ * NOFILL blocks are similar to regular leaf blocks only in the sense that
+ * they create dirty records that contain ARC buffers in each txg.  They
+ * don't need any frontend manipulation.
+ */
+dbuf_dirty_record_t *
+dbuf_dirty_nofill(dmu_buf_impl_t *db, dmu_tx_t *tx)
+{
+	dbuf_dirty_state_t dds;
+
+	ASSERT0(db->db_level);
+	ASSERT3U(db->db_blkid, !=, DMU_BONUS_BLKID);
+	ASSERT(db->db_state & (DB_UNCACHED|DB_NOFILL|DB_CACHED));
+
+	dbuf_dirty_enter(&dds, db, tx);
+	DBUF_STATE_CHANGE(db, =, DB_NOFILL, "allocating NOFILL buffer");
+	dbuf_clear_data(db);
+	dbuf_dirty_compute_state(&dds);
+
+	if (dds.txg_already_dirty)
+		/*
+		 * Reset immediate write sync state if needed.
+		 * XXX: Is this really needed for NOFILL buffers?
+		 */
+		dbuf_unoverride(dds.txg_dr);
+	else
+		dbuf_dirty_record_create_nofill(&dds);
+
+	dbuf_dirty_exit(&dds);
+	return (dds.txg_dr);
+}
+
+/*
+ * Dirty an indirect block.  See dbuf_dirty.
+ *
+ * Indirect blocks are always completely rewritten, so they don't need any
+ * complex frontend manipulation.
+ */
+static dbuf_dirty_record_t *
+dbuf_dirty_indirect(dmu_buf_impl_t *db, dmu_tx_t *tx)
+{
+	dbuf_dirty_state_t dds;
+
+	dbuf_dirty_enter(&dds, db, tx);
+	dbuf_dirty_compute_state(&dds);
+
+	if (!dds.txg_already_dirty)
+		dbuf_dirty_record_create_indirect(&dds);
+
+	dbuf_dirty_exit(&dds);
+	return (dds.txg_dr);
+}
+
+static void
+dbuf_dirty_set_data(dbuf_dirty_state_t *dds)
+{
+	arc_buf_t *buf = dds->fill_buf;
+	if (buf == NULL)
+		buf = dbuf_alloc_arcbuf(dds->db);
+	dbuf_set_data(dds->db, buf);
+}
+
+static void
+dbuf_dirty_leaf_with_existing_frontend(dbuf_dirty_state_t *dds)
+{
+	dmu_buf_impl_t *db = dds->db;
+	int size = db->db.db_size;
+	dbuf_dirty_record_t *newest = list_head(&db->db_dirty_records);
+	boolean_t old_txg_is_frontend = !dds->txg_already_dirty &&
+	    newest != NULL && newest->dt.dl.dr_data == db->db_buf;
+	arc_buf_t *fill_buf = dds->fill_buf;
+
+	ASSERT(fill_buf == NULL || fill_buf != db->db_buf);
+	ASSERT(refcount_count(&db->db_holds) > db->db_dirtycnt);
+
+	/* Reset any immediate write that has occurred. */
+	if (dds->txg_already_dirty)
+		dbuf_unoverride(dds->txg_dr);
+
+	/* If the old txg's record owns the frontend, give it its own copy. */
+	if (old_txg_is_frontend) {
+		if (newest == db->db_data_pending) {
+			/*
+			 * The syncer or holder normally disassociate.  But if
+			 * the syncer is performing a deferred resolve, then
+			 * it will not disassociate until the resolve
+			 * completes.  Since the syncer has already
+			 * scheduled its write with its buffer, we must
+			 * disassociate by replacing the frontend.
+			 */
+			ASSERT(db->db_state & (DB_READ|DB_PARTIAL));
+			ASSERT(db->db_dirtycnt == 1);
+			dbuf_dirty_set_data(dds);
+		} else {
+			newest->dt.dl.dr_data = dbuf_alloc_arcbuf(db);
+			bcopy(db->db.db_data, newest->dt.dl.dr_data->b_data,
+			    size);
+			arc_release(db->db_buf, db);
+			if (fill_buf) {
+				bcopy(fill_buf->b_data, db->db.db_data, size);
+				ASSERT(arc_released(fill_buf));
+				VERIFY(arc_buf_remove_ref(fill_buf, db));
+			}
+		}
+		return;
+	}
+
+	/* We have a filled buffer and already own the current frontend. */
+	if (fill_buf) {
+		arc_release(db->db_buf, db);
+		bcopy(fill_buf->b_data, db->db.db_data, size);
+		ASSERT(arc_released(fill_buf));
+		VERIFY(arc_buf_remove_ref(fill_buf, db));
+		return;
+	}
+
+	/* Frontend not owned by anybody.  Notify that it will be modified. */
+	ASSERT(newest == NULL || fill_buf == NULL);
+	if (dds->txg_already_dirty) {
+		/* Already released on initial dirty, so just thaw. */
+		ASSERT(arc_released(db->db_buf));
+		arc_buf_thaw(db->db_buf);
+	} else
+		arc_release(db->db_buf, db);
+}
+
+static void
+dbuf_dirty_record_create_leaf(dbuf_dirty_state_t *dds)
+{
+	dmu_buf_impl_t *db = dds->db;
+	dbuf_dirty_record_t *dr;
+	dnode_t *dn = dds->dn;
+	int txgoff = dds->tx->tx_txg & TXG_MASK;
+
+	dr = dbuf_dirty_record_create(dds);
+
+	/*
+	 * If this block was marked to be freed in this txg, revert that
+	 * change.  Note that db_freed_in_flight may have already been
+	 * processed, so it can't be checked here.
+	 */
+	if (db->db_blkid != DMU_SPILL_BLKID) {
+		mutex_enter(&dds->dn->dn_mtx);
+		if (dn->dn_free_ranges[txgoff] != NULL) {
+			range_tree_clear(dn->dn_free_ranges[txgoff],
+			    db->db_blkid, 1);
+		}
+		mutex_exit(&dds->dn->dn_mtx);
+		db->db_freed_in_flight = FALSE;
+	}
+	dbuf_dirty_record_register_as_leaf(dds);
+}
+
+static void
+dbuf_dirty_leaf_common(dbuf_dirty_state_t *dds)
+{
+	dmu_buf_impl_t *db = dds->db;
+
+	if (db->db_buf == NULL)
+		dbuf_dirty_set_data(dds);
+	else
+		dbuf_dirty_leaf_with_existing_frontend(dds);
+	ASSERT(arc_released(db->db_buf) && arc_buf_frozen(db->db_buf, B_FALSE));
+
+	if (!dds->txg_already_dirty)
+		dbuf_dirty_record_create_leaf(dds);
+	else
+		dbuf_dirty_record_update_leaf(dds);
+
+	if (db->db_state != DB_CACHED)
+		dbuf_dirty_record_add_range(dds->txg_dr, dds->offset,
+		    dds->size);
+}
+
+dbuf_dirty_record_t *
+dbuf_dirty_record_create_bonus(dbuf_dirty_state_t *dds)
+{
+	dmu_buf_impl_t *db = dds->db;
+	dbuf_dirty_record_t *newest = list_head(&db->db_dirty_records);
+	boolean_t last_txg_is_frontend = newest != NULL &&
+	    newest->dt.dl.dr_data == db->db.db_data;
+	dbuf_dirty_record_t *dr;
+
+	if (last_txg_is_frontend) {
+		newest->dt.dl.dr_data = zio_buf_alloc(DN_MAX_BONUSLEN);
+		arc_space_consume(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
+		bcopy(db->db.db_data, newest->dt.dl.dr_data, DN_MAX_BONUSLEN);
+	}
+	dr = dbuf_dirty_record_create(dds);
+	dbuf_dirty_record_register_as_leaf(dds);
 	return (dr);
+}
+
+/*
+ * Dirty a dbuf belonging to a meta-dnode.  See dbuf_dirty.
+ *
+ * Dbufs belonging to the meta-dnode object are allowed to dirty in older
+ * transaction groups.  Additionally, they will always be overwritten in
+ * each transaction group, which means no complex frontend manipulation.
+ * This simplifies the logic considerably compared to normal leaf objects.
+ */
+dbuf_dirty_record_t *
+dbuf_dirty_mdn_object(dmu_buf_impl_t *db, dmu_tx_t *tx)
+{
+	dbuf_dirty_state_t dds;
+
+	ASSERT0(db->db_level);
+	ASSERT(db->db_blkid != DMU_BONUS_BLKID);
+
+	dbuf_dirty_enter(&dds, db, tx);
+	dbuf_dirty_compute_state(&dds);
+
+	if (db->db_buf == NULL)
+		dbuf_set_data(db, dbuf_alloc_arcbuf(db));
+
+	if (dds.txg_already_dirty)
+		dbuf_unoverride(dds.txg_dr);
+	else
+		(void) dbuf_dirty_record_create_leaf(&dds);
+
+	dbuf_dirty_exit(&dds);
+	return (dds.txg_dr);
+}
+
+/*
+ * Dirty a bonus dbuf.  See dbuf_dirty.
+ *
+ * Bonus buffers are special in the sense that they do not use ARC buffers,
+ * but instead occupy space inside the dnode physical block.  The dbuf
+ * layer's primary role is to provide a transactional mechanism for updating
+ * this special dnode section.  Underlying bonus blocks therefore always use
+ * special zio buffers, and never share information between transactions.
+ */
+dbuf_dirty_record_t *
+dbuf_dirty_bonus(dmu_buf_impl_t *db, dmu_tx_t *tx)
+{
+	dbuf_dirty_state_t dds;
+
+	ASSERT(db->db_blkid == DMU_BONUS_BLKID);
+	/* Can't dirty a bonus buffer without first reading it. */
+	ASSERT(db->db_state == DB_CACHED);
+	dbuf_dirty_enter(&dds, db, tx);
+	dbuf_dirty_compute_state(&dds);
+
+	if (!dds.txg_already_dirty)
+		(void) dbuf_dirty_record_create_bonus(&dds);
+
+	dbuf_dirty_exit(&dds);
+	return (dds.txg_dr);
+
+/*
+ * Handle potential Copy-On-Write (COW) faults.
+ *
+ * This function's primary purpose is to optimize dirtying behavior that are
+ * likely to involve COW faults.
+ */
+static void
+dbuf_dirty_handle_fault(dbuf_dirty_state_t *dds)
+{
+	dmu_buf_impl_t *db = dds->db;
+
+	ASSERT0(db->db_level);
+	if (db->db_state & DB_PARTIAL) {
+		dbuf_dirty_record_t *dr = list_head(&db->db_dirty_records);
+		if (dr->dr_txg != dds->tx->tx_txg) {
+			/*
+			 * The newest dirty record's transaction group has
+			 * closed.  Since COW fault resolution can't be
+			 * avoided, there is no benefit to waiting until the
+			 * dirty record reaches the syncer.  Start
+			 * asynchronous fault resolution now.
+			 */
+			dbuf_transition_to_read(db);
+		}
+	} else if (db->db_state == DB_UNCACHED) {
+		int write_end = dds->offset + dds->size;
+
+		if (dds->offset != 0 && write_end != db->db.db_size) {
+			/*
+			 * Immediately start resolving a COW fault if we start
+			 * writing inside the block rather than either at the
+			 * beginning (forward) or end (backward).  Future
+			 * writes are unlikely to fill this dbuf.
+			 */
+			dbuf_transition_to_read(db);
+		} else if (dds->size != db->db.db_size) {
+			/*
+			 * If this dirty won't fill the buffer, see if a
+			 * previous version is in the ARC.  This skips the
+			 * partial buffer bookkeeping that would otherwise
+			 * be necessary.
+			 */
+			dbuf_read_cached(db, dds->dn);
+		}
+	}
+}
+
+/*
+ * Common dbuf_dirty_enter() replacement for leaf blocks.
+ */
+void
+dbuf_dirty_leaf_enter(dbuf_dirty_state_t *dds,
+    dmu_buf_impl_t *db, dmu_tx_t *tx, int offset, int size)
+{
+	dbuf_dirty_enter(dds, db, tx);
+	dds->offset = offset;
+	dds->size = size;
+	/*
+	 * Handle COW faults prior to computing the dirty state, since
+	 * transitioning to read drops the lock.
+	 */
+	dbuf_dirty_handle_fault(dds);
+	dbuf_dirty_compute_state(dds);
+}
+
+/*
+ * Dirty a regular leaf block.  See dbuf_dirty.
+ *
+ * This function handles dirtying all user data blocks.
+ */
+dbuf_dirty_record_t *
+dbuf_dirty_leaf(dmu_buf_impl_t *db, dmu_tx_t *tx, int offset, int size)
+{
+	dbuf_dirty_state_t dds;
+
+	ASSERT3U(db->db.db_object, !=, DMU_META_DNODE_OBJECT);
+	ASSERT3U(db->db_blkid, !=, DMU_BONUS_BLKID);
+	ASSERT0(db->db_level);
+
+	dbuf_dirty_leaf_enter(&dds, db, tx, offset, size);
+
+	if (db->db_state == DB_UNCACHED)
+		DBUF_STATE_CHANGE(db, =, (DB_PARTIAL|DB_FILL),
+		    "notifying of initial partial fill");
+	else if (db->db_state & (DB_READ|DB_PARTIAL) != 0)
+		DBUF_STATE_CHANGE(db, |=, DB_FILL,
+		    "notifying of followup partial fill");
+	dbuf_dirty_leaf_common(&dds);
+
+	dbuf_dirty_exit(&dds);
+	return (dds.txg_dr);
+}
+
+/*
+ * Dirty a regular leaf block with a filled ARC buffer.  See dbuf_dirty.
+ *
+ * This function is identical to dbuf_dirty_leaf, except that it doesn't
+ * have to handle partial fills, since it is always provided an already
+ * filled buffer that is the write data for the transaction.
+ */
+dbuf_dirty_record_t *
+dbuf_dirty_with_arcbuf(dmu_buf_impl_t *db, dmu_tx_t *tx, arc_buf_t *fill_buf)
+{
+	dbuf_dirty_state_t dds;
+
+	ASSERT0(db->db_level);
+
+	dbuf_dirty_leaf_enter(&dds, db, tx, 0, db->db.db_size);
+	dds.fill_buf = fill_buf;
+
+	if (db->db_state != DB_CACHED)
+		DBUF_STATE_CHANGE(db, =, DB_FILL, "assigning filled buffer");
+	dbuf_dirty_leaf_common(&dds);
+
+	dbuf_dirty_exit(&dds);
+	return (dds.txg_dr);
+}
+
+/*
+ * Dirty a DMU buffer.
+ *
+ * This function is merely a dispatcher.  Different types of dbufs require
+ * different actions in different scenarios.  However, each dbuf_dirty
+ * implementing function should follow the same basic order:
+ *
+ * 1. dbuf_dirty_enter (grab the dbuf mutex)
+ * 2. Do any pre-dirty optimizations or fixups needed.
+ * *** Beyond this point, the dbuf mutex must always be held. ***
+ * 3. dbuf_dirty_compute_state (compute the basic dbuf_dirty state)
+ * 4. Change the dbuf state as applicable
+ * 5. Make the frontend (db->db_buf) usable by the dirty record for this txg.
+ * 6. Create or update this txg's dirty record, if needed.
+ * 7. dbuf_dirty_exit, which triggers dirtying parent dbufs if this dbuf was
+ *    not already dirty in this txg.
+ *
+ * NOTE: The point of having separate functions is to reduce the difficulty
+ *       of understanding what happens to each type of dbuf in a dirty.
+ */
+dbuf_dirty_record_t *
+dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
+{
+	if (db->db_blkid == DMU_BONUS_BLKID) {
+		return (dbuf_dirty_bonus(db, tx));
+	} else if (db->db_level == 0) {
+		if (db->db.db_object == DMU_META_DNODE_OBJECT)
+			return (dbuf_dirty_mdn_object(db, tx));
+		else
+			return (dbuf_dirty_leaf(db, tx, 0, db->db.db_size));
+	} else {
+		return (dbuf_dirty_indirect(db, tx));
+	}
+}
+
+/* XXX: refactor dbuf_undirty_*() into dbuf_undirty(). */
+static void
+dbuf_undirty_bonus(dbuf_dirty_record_t *dr)
+{
+	dmu_buf_impl_t *db = dr->dr_dbuf;
+
+	if (dr->dt.dl.dr_data != db->db.db_data) {
+		zio_buf_free(dr->dt.dl.dr_data, DN_MAX_BONUSLEN);
+		arc_space_return(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
+	}
+	db->db_data_pending = NULL;
+	ASSERT(list_next(&db->db_dirty_records, dr) == NULL);
+	list_remove(&db->db_dirty_records, dr);
+	kmem_free(dr, sizeof (dbuf_dirty_record_t));
+	ASSERT(db->db_dirtycnt > 0);
+	db->db_dirtycnt -= 1;
+}
+
+static void
+dbuf_undirty_leaf(dbuf_dirty_record_t *dr)
+{
+	dmu_buf_impl_t *db = dr->dr_dbuf;
+	spa_t *spa = dmu_objset_spa(db->db_objset);
+
+	ASSERT(db->db_blkid != DMU_BONUS_BLKID);
+	if (db->db_state == DB_NOFILL)
+		return;
+
+	if (dr->dt.dl.dr_data != db->db_buf) {
+		if (list_is_empty(&db->db_dirty_records) &&
+		    !arc_released(db->db_buf)) {
+			/*
+			 * A syncer split preemptively duplicated the ARC
+			 * buffer in case the dbuf was dirtied again.  The
+			 * dbuf has not been re-dirtied.  Transfer cache
+			 * state to the foreground buffer so it is
+			 * retained in the cache after the last dbuf
+			 * reference is removed.
+			 */
+			arc_transfer_cache_state(dr->dt.dl.dr_data, db->db_buf);
+			arc_set_callback(db->db_buf, dbuf_do_evict, db);
+		}
+
+		/*
+		 * The data in the ARC buffer for this dirty record is
+		 * either out of date, or duplicates the contents of
+		 * the foreground buffer.  Free it.
+		 */
+		VERIFY(arc_buf_remove_ref(dr->dt.dl.dr_data, db));
+	} else if (!arc_released(db->db_buf)) {
+		/*
+		 * Our dbuf hasn't already been evicted, so
+		 * register a callback to clean it up once
+		 * its ARC buffer is released.
+		 */
+		arc_set_callback(db->db_buf, dbuf_do_evict, db);
+	}
+}
+
+static void
+dbuf_undirty_indirect(dbuf_dirty_record_t *dr)
+{
+	dnode_t *dn;
+	dmu_buf_impl_t *db = dr->dr_dbuf;
+
+	DB_DNODE_ENTER(db);
+	dn = DB_DNODE(db);
+	ASSERT(list_head(&dr->dt.di.dr_children) == NULL);
+	/*
+	 * The size of an indirect block must match what its
+	 * associated dnode thinks it should be.
+	 */
+	ASSERT3U(db->db.db_size, ==, 1 << dn->dn_phys->dn_indblkshift);
+	/*
+	 * If the dbuf's block pointer is not a hole, evict it when
+	 * its last ARC buffer hold has been released.
+	 */
+	if (!BP_IS_HOLE(db->db_blkptr)) {
+		int epbs = dn->dn_phys->dn_indblkshift - SPA_BLKPTRSHIFT;
+		ASSERT3U(db->db_blkid, <=,
+		    dn->dn_phys->dn_maxblkid >> (db->db_level * epbs));
+		ASSERT3U(BP_GET_LSIZE(db->db_blkptr), ==, db->db.db_size);
+		if (!arc_released(db->db_buf))
+			arc_set_callback(db->db_buf, dbuf_do_evict, db);
+	}
+	DB_DNODE_EXIT(db);
+	mutex_destroy(&dr->dt.di.dr_mtx);
+	list_destroy(&dr->dt.di.dr_children);
+}
+
+static void
+dbuf_undirty_write(dbuf_dirty_record_t *dr, uint64_t txg)
+{
+	dmu_buf_impl_t *db = dr->dr_dbuf;
+
+	ASSERT(!list_link_active(&dr->dr_dirty_node));
+	/* There should be no older dirty records. */
+	ASSERT(list_next(&db->db_dirty_records, dr) == NULL);
+	list_remove(&db->db_dirty_records, dr);
+
+#ifdef ZFS_DEBUG
+	if (db->db_blkid == DMU_SPILL_BLKID) {
+		dnode_t *dn;
+
+		DB_DNODE_ENTER(db);
+		dn = DB_DNODE(db);
+		ASSERT(dn->dn_phys->dn_flags & DNODE_FLAG_SPILL_BLKPTR);
+		ASSERT(!(BP_IS_HOLE(db->db_blkptr)) &&
+		    db->db_blkptr == &dn->dn_phys->dn_spill);
+		DB_DNODE_EXIT(db);
+	}
+#endif
+
+	/* Clean up the dirty record. */
+	if (db->db_level == 0) {
+		dbuf_undirty_leaf(dr);
+	} else {
+		dbuf_undirty_indirect(dr);
+	}
+	kmem_free(dr, sizeof (dbuf_dirty_record_t));
+
+	cv_broadcast(&db->db_changed);
+	ASSERT(db->db_dirtycnt > 0);
+	db->db_dirtycnt -= 1;
+	db->db_data_pending = NULL;
 }
 
 /*
@@ -1422,7 +2278,7 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 {
 	dnode_t *dn;
 	uint64_t txg = tx->tx_txg;
-	dbuf_dirty_record_t *dr, **drp;
+	dbuf_dirty_record_t *dr;
 
 	ASSERT(txg != 0);
 
@@ -1442,10 +2298,8 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	/*
 	 * If this buffer is not dirty, we're done.
 	 */
-	for (drp = &db->db_last_dirty; (dr = *drp) != NULL; drp = &dr->dr_next)
-		if (dr->dr_txg <= txg)
-			break;
-	if (dr == NULL || dr->dr_txg < txg)
+	dr = dbuf_get_dirty_record_for_txg(db, txg);
+	if (dr == NULL)
 		return (B_FALSE);
 	ASSERT(dr->dr_txg == txg);
 	ASSERT(dr->dr_dbuf == db);
@@ -1460,7 +2314,7 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	dsl_pool_undirty_space(dmu_objset_pool(dn->dn_objset),
 	    dr->dr_accounted, txg);
 
-	*drp = dr->dr_next;
+	list_remove(&db->db_dirty_records, dr);
 
 	/*
 	 * Note that there are three places in dbuf_dirty()
@@ -1546,6 +2400,7 @@ dmu_buf_will_dirty(dmu_buf_t *db_fake, dmu_tx_t *tx)
 		rf |= DB_RF_HAVESTRUCT;
 	DB_DNODE_EXIT(db);
 	(void) dbuf_read(db, NULL, rf);
+	/* Already CACHED or UNCACHED at this point */
 	(void) dbuf_dirty(db, tx);
 }
 
@@ -1554,9 +2409,7 @@ dmu_buf_will_not_fill(dmu_buf_t *db_fake, dmu_tx_t *tx)
 {
 	dmu_buf_impl_t *db = (dmu_buf_impl_t *)db_fake;
 
-	db->db_state = DB_NOFILL;
-
-	dmu_buf_will_fill(db_fake, tx);
+	dbuf_dirty_nofill(db, tx);
 }
 
 void
@@ -1572,8 +2425,11 @@ dmu_buf_will_fill(dmu_buf_t *db_fake, dmu_tx_t *tx)
 	ASSERT(db->db.db_object != DMU_META_DNODE_OBJECT ||
 	    dmu_tx_private_ok(tx));
 
-	dbuf_noread(db);
-	(void) dbuf_dirty(db, tx);
+	/* Wait for another filler to finish. */
+	while (db->db_state & DB_FILL)
+		cv_wait(&db->db_changed, &db->db_mtx);
+
+	dbuf_dirty_leaf(db, tx, 0, db->db.db_size);
 }
 
 #pragma weak dmu_buf_fill_done = dbuf_fill_done
@@ -1585,14 +2441,25 @@ dbuf_fill_done(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	DBUF_VERIFY(db);
 
 	if (db->db_state == DB_FILL) {
-		if (db->db_level == 0 && db->db_freed_in_flight) {
+		dbuf_dirty_record_t *dr;
+
+		dr = list_head(&db->db_dirty_records);
+		ASSERT(dr->dr_txg == tx->tx_txg);
+		ASSERT(dr != db->db_data_pending);
+
+		if (db->db_freed_in_flight) {
+			ASSERT0(db->db_level);
 			ASSERT(db->db_blkid != DMU_BONUS_BLKID);
 			/* we were freed while filling */
 			/* XXX dbuf_undirty? */
 			bzero(db->db.db_data, db->db.db_size);
 			db->db_freed_in_flight = FALSE;
+			DBUF_STATE_CHANGE(db, =, DB_CACHED,
+			    "fill done handling freed in flight");
+		} else {
+			DBUF_STATE_CHANGE(db, =, DB_CACHED,
+			    "filler finished, complete buffer");
 		}
-		db->db_state = DB_CACHED;
 		cv_broadcast(&db->db_changed);
 	}
 	mutex_exit(&db->db_mtx);
@@ -1653,49 +2520,8 @@ dbuf_assign_arcbuf(dmu_buf_impl_t *db, arc_buf_t *buf, dmu_tx_t *tx)
 	arc_return_buf(buf, db);
 	ASSERT(arc_released(buf));
 
-	mutex_enter(&db->db_mtx);
-
-	while (db->db_state == DB_READ || db->db_state == DB_FILL)
-		cv_wait(&db->db_changed, &db->db_mtx);
-
-	ASSERT(db->db_state == DB_CACHED || db->db_state == DB_UNCACHED);
-
-	if (db->db_state == DB_CACHED &&
-	    refcount_count(&db->db_holds) - 1 > db->db_dirtycnt) {
-		mutex_exit(&db->db_mtx);
-		(void) dbuf_dirty(db, tx);
-		bcopy(buf->b_data, db->db.db_data, db->db.db_size);
-		VERIFY(arc_buf_remove_ref(buf, db));
-		xuio_stat_wbuf_copied();
-		return;
-	}
-
-	xuio_stat_wbuf_nocopy();
-	if (db->db_state == DB_CACHED) {
-		dbuf_dirty_record_t *dr = db->db_last_dirty;
-
-		ASSERT(db->db_buf != NULL);
-		if (dr != NULL && dr->dr_txg == tx->tx_txg) {
-			ASSERT(dr->dt.dl.dr_data == db->db_buf);
-			if (!arc_released(db->db_buf)) {
-				ASSERT(dr->dt.dl.dr_override_state ==
-				    DR_OVERRIDDEN);
-				arc_release(db->db_buf, db);
-			}
-			dr->dt.dl.dr_data = buf;
-			VERIFY(arc_buf_remove_ref(db->db_buf, db));
-		} else if (dr == NULL || dr->dt.dl.dr_data != db->db_buf) {
-			arc_release(db->db_buf, db);
-			VERIFY(arc_buf_remove_ref(db->db_buf, db));
-		}
-		db->db_buf = NULL;
-	}
-	ASSERT(db->db_buf == NULL);
-	dbuf_set_data(db, buf);
-	db->db_state = DB_FILL;
-	mutex_exit(&db->db_mtx);
-	(void) dbuf_dirty(db, tx);
-	dmu_buf_fill_done(&db->db, tx);
+	(void) dbuf_dirty_with_arcbuf(db, tx, buf);
+	dbuf_fill_done(db, tx);
 }
 
 /*
@@ -1703,10 +2529,14 @@ dbuf_assign_arcbuf(dmu_buf_impl_t *db, arc_buf_t *buf, dmu_tx_t *tx)
  * EVICTING and clear *most* of its references.  Unfortunately,
  * when we are not holding the dn_dbufs_mtx, we can't clear the
  * entry in the dn_dbufs list.  We have to wait until dbuf_destroy()
- * in this case.  For callers from the DMU we will usually see:
+ * in this case.
+ *
+ * For callers from the DMU we will usually see:
  *	dbuf_clear()->arc_clear_callback()->dbuf_do_evict()->dbuf_destroy()
+ *
  * For the arc callback, we will usually see:
  *	dbuf_do_evict()->dbuf_clear();dbuf_destroy()
+ *
  * Sometimes, though, we will get a mix of these two:
  *	DMU: dbuf_clear()->arc_clear_callback()
  *	ARC: dbuf_do_evict()->dbuf_destroy()
@@ -1734,13 +2564,13 @@ dbuf_clear(dmu_buf_impl_t *db)
 			arc_space_return(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
 		}
 		db->db.db_data = NULL;
-		db->db_state = DB_UNCACHED;
+		DBUF_STATE_CHANGE(db, =, DB_UNCACHED, "buffer cleared");
 	}
 
 	ASSERT(db->db_state == DB_UNCACHED || db->db_state == DB_NOFILL);
 	ASSERT(db->db_data_pending == NULL);
 
-	db->db_state = DB_EVICTING;
+	DBUF_STATE_CHANGE(db, =, DB_EVICTING, "buffer eviction started");
 	db->db_blkptr = NULL;
 
 	DB_DNODE_ENTER(db);
@@ -1864,6 +2694,9 @@ dbuf_create(dnode_t *dn, uint8_t level, uint64_t blkid,
 
 	db = kmem_cache_alloc(dbuf_cache, KM_SLEEP);
 
+	list_create(&db->db_dirty_records, sizeof (dbuf_dirty_record_t),
+	    offsetof(dbuf_dirty_record_t, db_dirty_record_link));
+
 	db->db_objset = os;
 	db->db.db_object = dn->dn_object;
 	db->db_level = level;
@@ -1885,7 +2718,7 @@ dbuf_create(dnode_t *dn, uint8_t level, uint64_t blkid,
 		    (dn->dn_nblkptr-1) * sizeof (blkptr_t);
 		ASSERT3U(db->db.db_size, >=, dn->dn_bonuslen);
 		db->db.db_offset = DMU_BONUS_BLKID;
-		db->db_state = DB_UNCACHED;
+		DBUF_STATE_CHANGE(db, =, DB_UNCACHED, "bonus buffer created");
 		/* the bonus dbuf is not placed in the hash table */
 		arc_space_consume(sizeof (dmu_buf_impl_t), ARC_SPACE_OTHER);
 		return (db);
@@ -1908,7 +2741,7 @@ dbuf_create(dnode_t *dn, uint8_t level, uint64_t blkid,
 	 * dn_dbufs list.
 	 */
 	mutex_enter(&dn->dn_dbufs_mtx);
-	db->db_state = DB_EVICTING;
+	db->db_state = DB_EVICTING; /* not worth logging this state change */
 	if ((odb = dbuf_hash_insert(db)) != NULL) {
 		/* someone else inserted it first */
 		kmem_cache_free(dbuf_cache, db);
@@ -1919,7 +2752,7 @@ dbuf_create(dnode_t *dn, uint8_t level, uint64_t blkid,
 	if (db->db_level == 0 && db->db_blkid >=
 	    dn->dn_unlisted_l0_blkid)
 		dn->dn_unlisted_l0_blkid = db->db_blkid + 1;
-	db->db_state = DB_UNCACHED;
+	DBUF_STATE_CHANGE(db, =, DB_UNCACHED, "regular buffer created");
 	mutex_exit(&dn->dn_dbufs_mtx);
 	arc_space_consume(sizeof (dmu_buf_impl_t), ARC_SPACE_OTHER);
 
@@ -1945,6 +2778,7 @@ dbuf_do_evict(void *private)
 		mutex_enter(&db->db_mtx);
 
 	ASSERT(refcount_is_zero(&db->db_holds));
+	ASSERT(list_is_empty(&db->db_dirty_records));
 
 	if (db->db_state != DB_EVICTING) {
 		ASSERT(db->db_state == DB_CACHED);
@@ -1991,6 +2825,7 @@ dbuf_destroy(dmu_buf_impl_t *db)
 	}
 	db->db_parent = NULL;
 	db->db_buf = NULL;
+	list_destroy(&db->db_dirty_records);
 
 	ASSERT(db->db.db_data == NULL);
 	ASSERT(db->db_hash_next == NULL);
@@ -2269,20 +3104,16 @@ top:
 	 * still referencing it from db_data, we need to make a copy
 	 * of it in case we decide we want to dirty it again in this txg.
 	 */
-	if (db->db_level == 0 && db->db_blkid != DMU_BONUS_BLKID &&
+	if (db->db_data_pending && db->db_level == 0 &&
 	    dn->dn_object != DMU_META_DNODE_OBJECT &&
-	    db->db_state == DB_CACHED && db->db_data_pending) {
+	    db->db_state == DB_CACHED) {
 		dbuf_dirty_record_t *dr = db->db_data_pending;
 
-		if (dr->dt.dl.dr_data == db->db_buf) {
-			arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
+		/* dbuf_sync_bonus does not set db_data_pending. */
+		ASSERT(db->db_blkid != DMU_BONUS_BLKID);
 
-			dbuf_set_data(db,
-			    arc_buf_alloc(dn->dn_objset->os_spa,
-			    db->db.db_size, db, type));
-			bcopy(dr->dt.dl.dr_data->b_data, db->db.db_data,
-			    db->db.db_size);
-		}
+		if (dr->dt.dl.dr_data == db->db_buf)
+			dbuf_set_data(db, dbuf_clone_arcbuf(db));
 	}
 
 	(void) refcount_add(&db->db_holds, tag);
@@ -2699,6 +3530,29 @@ dbuf_sync_indirect(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 }
 
 static void
+dbuf_sync_bonus(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
+{
+	dmu_buf_impl_t *db = dr->dr_dbuf;
+	void *data = dr->dt.dl.dr_data;
+	dnode_t *dn;
+
+	ASSERT0(db->db_level);
+	ASSERT(MUTEX_HELD(&db->db_mtx));
+	ASSERT(DB_DNODE_HELD(db));
+	ASSERT(db->db_blkid == DMU_BONUS_BLKID);
+	ASSERT(data != NULL);
+
+	dn = DB_DNODE(db);
+	ASSERT3U(dn->dn_phys->dn_bonuslen, <=, DN_MAX_BONUSLEN);
+
+	bcopy(data, DN_BONUS(dn->dn_phys), dn->dn_phys->dn_bonuslen);
+	DB_DNODE_EXIT(db);
+
+	dbuf_undirty_bonus(dr);
+	dbuf_rele_and_unlock(db, (void *)(uintptr_t)tx->tx_txg);
+}
+
+static void
 dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 {
 	arc_buf_t **datap = &dr->dt.dl.dr_data;
@@ -2743,29 +3597,7 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 	 * be called).
 	 */
 	if (db->db_blkid == DMU_BONUS_BLKID) {
-		dbuf_dirty_record_t **drp;
-
-		ASSERT(*datap != NULL);
-		ASSERT0(db->db_level);
-		ASSERT3U(dn->dn_phys->dn_bonuslen, <=, DN_MAX_BONUSLEN);
-		bcopy(*datap, DN_BONUS(dn->dn_phys), dn->dn_phys->dn_bonuslen);
-		DB_DNODE_EXIT(db);
-
-		if (*datap != db->db.db_data) {
-			zio_buf_free(*datap, DN_MAX_BONUSLEN);
-			arc_space_return(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
-		}
-		db->db_data_pending = NULL;
-		drp = &db->db_last_dirty;
-		while (*drp != dr)
-			drp = &(*drp)->dr_next;
-		ASSERT(dr->dr_next == NULL);
-		ASSERT(dr->dr_dbuf == db);
-		*drp = dr->dr_next;
-		kmem_free(dr, sizeof (dbuf_dirty_record_t));
-		ASSERT(db->db_dirtycnt > 0);
-		db->db_dirtycnt -= 1;
-		dbuf_rele_and_unlock(db, (void *)(uintptr_t)txg);
+		dbuf_sync_bonus(dr, tx);
 		return;
 	}
 
@@ -2810,7 +3642,10 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 		*datap = arc_buf_alloc(os->os_spa, blksz, db, type);
 		bcopy(db->db.db_data, (*datap)->b_data, blksz);
 	}
+
+	/* Notify the world that this dirty record is about to write. */
 	db->db_data_pending = dr;
+	ASSERT(list_next(&db->db_dirty_records, dr) == NULL);
 
 	mutex_exit(&db->db_mtx);
 
