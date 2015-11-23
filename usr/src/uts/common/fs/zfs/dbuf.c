@@ -61,14 +61,6 @@ extern inline void dmu_buf_init_user(dmu_buf_user_t *dbu,
     dmu_buf_evict_func_t *evict_func, dmu_buf_t **clear_on_evict_dbufp);
 #endif /* ! __lint */
 
-#define	_DBUF_CONSTANT_FMT \
-	" offset %llu os %p level %d holds %lld dirty %d state %d\n"
-#define	_DBUF_CONSTANT_FMT_ARGS(db) \
-	(db)->db.db_offset, (db)->db_objset, (db)->db_level, \
-	refcount_count(&(db)->db_holds), (db)->db_dirtycnt, (db)->db_state
-
-#define	tmpprintf(args...) do { } while (0)
-
 /*
  * Global data structures and functions for the dbuf cache.
  */
@@ -1341,10 +1333,6 @@ dbuf_free_range_disassociate_frontend(dmu_buf_impl_t *db, dnode_t *dn,
 	dbuf_dirty_record_t *dr;
 
 	dr = list_head(&db->db_dirty_records);
-	tmpprintf("%s db %p dr %p holds %lu dirties %d txg %llu\n",
-	    __func__, db, dr, refcount_count(&db->db_holds),
-	    db->db_dirtycnt, tx->tx_txg);
-
 	if (dr == NULL)
 		return;
 
@@ -2879,7 +2867,6 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	if (refcount_remove(&db->db_holds, (void *)(uintptr_t)txg) == 0) {
 		arc_buf_t *buf = db->db_buf;
 
-		tmpprintf("%s db %p clearing\n", __func__, db);
 		ASSERT(db->db_state == DB_NOFILL || arc_released(buf));
 		dbuf_clear_data(db);
 		VERIFY(arc_buf_remove_ref(buf, db));
