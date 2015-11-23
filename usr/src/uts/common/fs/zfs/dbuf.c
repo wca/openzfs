@@ -1967,7 +1967,7 @@ dbuf_dirty_compute_state(dbuf_dirty_state_t *dds)
 
 	newest = list_head(&db->db_dirty_records);
 
-	/* Only the mdn object may dirty an older txg.  */
+	/* Only the mdn object may dirty an older txg. */
 	ASSERT(newest == NULL || newest->dr_txg <= tx->tx_txg ||
 	    db->db.db_object == DMU_META_DNODE_OBJECT);
 
