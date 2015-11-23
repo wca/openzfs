@@ -3241,7 +3241,7 @@ dbuf_findbp(dnode_t *dn, int level, uint64_t blkid, int fail_sparse,
 	} else if (level < nlevels-1) {
 		/* this block is referenced from an indirect block */
 		int err = dbuf_hold_impl(dn, level+1,
-		    blkid >> epbs, fail_sparse, NULL, parentp, NULL);
+		    blkid >> epbs, fail_sparse, NULL, parentp);
 		if (err)
 			return (err);
 		err = dbuf_read(*parentp, NULL,
@@ -3730,8 +3730,7 @@ dmu_buf_impl_t *
 dbuf_hold_level(dnode_t *dn, int level, uint64_t blkid, void *tag)
 {
 	dmu_buf_impl_t *db;
-	int err = dbuf_hold_impl(dn, level, blkid, FALSE, FALSE, tag, &db,
-	    NULL);
+	int err = dbuf_hold_impl(dn, level, blkid, FALSE, FALSE, tag, &db);
 	return (err ? NULL : db);
 }
 
