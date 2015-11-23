@@ -1742,26 +1742,26 @@ dbuf_redirty(dbuf_dirty_record_t *dr)
  * of state available, so using a struct to access it keeps the code sane.
  */
 typedef struct dbuf_dirty_state {
-	dmu_buf_impl_t *db;		/* Dbuf being dirtied. */
-	dmu_tx_t *tx;			/* Transaction to dirty. */
-	dnode_t *dn;			/* The dbuf's dnode. */
-	dbuf_dirty_record_t *insert_pt;	/* DR to insert new DR after. */
-	dbuf_dirty_record_t *txg_dr;	/* Dirty record for this txg. */
-	boolean_t txg_already_dirty;	/* This txg already dirty? */
-	boolean_t do_free_accounting;	/* Free accounting needed? */
+	dmu_buf_impl_t *dds_db;			/* Dbuf being dirtied. */
+	dmu_tx_t *dds_tx;			/* Transaction to dirty. */
+	dnode_t *dds_dn;			/* The dbuf's dnode. */
+	dbuf_dirty_record_t *dds_insert_pt;	/* DR to insert new DR after. */
+	dbuf_dirty_record_t *dds_txg_dr;	/* Dirty record for this txg. */
+	boolean_t dds_txg_already_dirty;	/* This txg already dirty? */
+	boolean_t dds_do_free_accounting;	/* Free accounting needed? */
 
 	/* The below only apply to leaf blocks. */
-	arc_buf_t *fill_buf;		/* Already-filled optional buffer. */
-	int offset;			/* Offset of the upcoming write. */
-	int size;			/* Size of the upcoming write. */
+	arc_buf_t *dds_fill_buf;	/* Already-filled optional buffer. */
+	int dds_offset;			/* Offset of the upcoming write. */
+	int dds_size;			/* Size of the upcoming write. */
 } dbuf_dirty_state_t;
 
 static void
 dbuf_new_dirty_record_accounting(dbuf_dirty_state_t *dds)
 {
-	dnode_t *dn = dds->dn;
-	dmu_tx_t *tx = dds->tx;
-	dmu_buf_impl_t *db = dds->db;
+	dnode_t *dn = dds->dds_dn;
+	dmu_tx_t *tx = dds->dds_tx;
+	dmu_buf_impl_t *db = dds->dds_db;
 	objset_t *os = dn->dn_objset;
 
 	/*
@@ -1800,7 +1800,7 @@ dbuf_new_dirty_record_accounting(dbuf_dirty_state_t *dds)
 		 */
 		dnode_willuse_space(dn, db->db.db_size, tx);
 		if (db->db_blkid != DMU_SPILL_BLKID)
-			dds->do_free_accounting = dbuf_block_freeable(db);
+			dds->dds_do_free_accounting = dbuf_block_freeable(db);
 	}
 }
 
@@ -1808,23 +1808,23 @@ static dbuf_dirty_record_t *
 dbuf_dirty_record_create(dbuf_dirty_state_t *dds)
 {
 	dbuf_dirty_record_t *dr;
-	dmu_buf_impl_t *db = dds->db;
-	objset_t *os = dds->dn->dn_objset;
+	dmu_buf_impl_t *db = dds->dds_db;
+	objset_t *os = dds->dds_dn->dn_objset;
 
-	ASSERT(MUTEX_HELD(&dds->db->db_mtx));
-	ASSERT(DB_DNODE_HELD(dds->db));
-	ASSERT((dr = list_head(&dds->db->db_dirty_records)) == NULL ||
-	    dr->dr_txg != dds->tx->tx_txg);
+	ASSERT(MUTEX_HELD(&dds->dds_db->db_mtx));
+	ASSERT(DB_DNODE_HELD(dds->dds_db));
+	ASSERT((dr = list_head(&dds->dds_db->db_dirty_records)) == NULL ||
+	    dr->dr_txg != dds->dds_tx->tx_txg);
 
 	dbuf_new_dirty_record_accounting(dds);
 
-	ASSERT3P(dds->txg_dr, ==, NULL);
+	ASSERT3P(dds->dds_txg_dr, ==, NULL);
 	dr = kmem_zalloc(sizeof (dbuf_dirty_record_t), KM_SLEEP);
 	if (db->db_blkid != DMU_BONUS_BLKID && os->os_dsl_dataset != NULL)
 		dr->dr_accounted = db->db.db_size;
-	dr->dr_dbuf = dds->db;
-	dr->dr_txg = dds->tx->tx_txg;
-	dds->txg_dr = dr;
+	dr->dr_dbuf = dds->dds_db;
+	dr->dr_txg = dds->dds_tx->tx_txg;
+	dds->dds_txg_dr = dr;
 
 	return (dr);
 }
@@ -1832,15 +1832,16 @@ dbuf_dirty_record_create(dbuf_dirty_state_t *dds)
 static void
 dbuf_dirty_record_register(dbuf_dirty_state_t *dds)
 {
+	dmu_buf_impl_t *db = dds->dds_db;
 
-	ASSERT3P(dds->txg_dr, !=, NULL);
-	list_insert_after(&dds->db->db_dirty_records, dds->insert_pt,
-	    dds->txg_dr);
+	ASSERT3P(dds->dds_txg_dr, !=, NULL);
+	list_insert_after(&db->db_dirty_records, dds->dds_insert_pt,
+	    dds->dds_txg_dr);
 
 	/* This buffer is now part of this txg */
-	dbuf_add_ref(dds->db, (void *)(uintptr_t)dds->tx->tx_txg);
-	dds->db->db_dirtycnt += 1;
-	ASSERT3U(dds->db->db_dirtycnt, <=, TXG_CONCURRENT_STATES);
+	dbuf_add_ref(db, (void *)(uintptr_t)dds->dds_tx->tx_txg);
+	db->db_dirtycnt += 1;
+	ASSERT3U(db->db_dirtycnt, <=, TXG_CONCURRENT_STATES);
 }
 
 static void
@@ -1859,17 +1860,17 @@ dbuf_dirty_record_create_indirect(dbuf_dirty_state_t *dds)
 static void
 dbuf_dirty_record_update_leaf(dbuf_dirty_state_t *dds)
 {
-	if (dds->db->db_blkid == DMU_BONUS_BLKID)
-		dds->txg_dr->dt.dl.dr_data = dds->db->db.db_data;
+	if (dds->dds_db->db_blkid == DMU_BONUS_BLKID)
+		dds->dds_txg_dr->dt.dl.dr_data = dds->dds_db->db.db_data;
 	else
-		dds->txg_dr->dt.dl.dr_data = dds->db->db_buf;
+		dds->dds_txg_dr->dt.dl.dr_data = dds->dds_db->db_buf;
 }
 
 static void
 dbuf_dirty_record_register_as_leaf(dbuf_dirty_state_t *dds)
 {
-	dbuf_dirty_record_t *dr = dds->txg_dr;
-	dmu_buf_impl_t *db = dds->db;
+	dbuf_dirty_record_t *dr = dds->dds_txg_dr;
+	dmu_buf_impl_t *db = dds->dds_db;
 
 	dbuf_dirty_record_update_leaf(dds);
 	dprintf_dbuf(db, "%s: dr_data=%p\n", __func__, dr->dt.dl.dr_data);
@@ -1931,11 +1932,11 @@ dbuf_dirty_enter(dbuf_dirty_state_t *dds, dmu_buf_impl_t *db, dmu_tx_t *tx)
 	dbuf_dirty_record_t *dr;
 
 	memset(dds, 0, sizeof (*dds));
-	dds->db = db;
-	dds->tx = tx;
+	dds->dds_db = db;
+	dds->dds_tx = tx;
 
 	DB_DNODE_ENTER(db);
-	dds->dn = DB_DNODE(db);
+	dds->dds_dn = DB_DNODE(db);
 
 	mutex_enter(&db->db_mtx);
 }
@@ -1950,8 +1951,8 @@ dbuf_dirty_enter(dbuf_dirty_state_t *dds, dmu_buf_impl_t *db, dmu_tx_t *tx)
 static void
 dbuf_dirty_compute_state(dbuf_dirty_state_t *dds)
 {
-	dmu_buf_impl_t *db = dds->db;
-	dmu_tx_t *tx = dds->tx;
+	dmu_buf_impl_t *db = dds->dds_db;
+	dmu_tx_t *tx = dds->dds_tx;
 	dbuf_dirty_record_t *dr, *newest;
 
 	/* Only one filler allowed at a time. */
@@ -1962,8 +1963,8 @@ dbuf_dirty_compute_state(dbuf_dirty_state_t *dds)
 
 	dbuf_dirty_verify(db, tx);
 	if (db->db_blkid == DMU_SPILL_BLKID)
-		dds->dn->dn_have_spill = B_TRUE;
-	dnode_set_dirtyctx(dds->dn, tx, db);
+		dds->dds_dn->dn_have_spill = B_TRUE;
+	dnode_set_dirtyctx(dds->dds_dn, tx, db);
 
 	newest = list_head(&db->db_dirty_records);
 
@@ -1971,20 +1972,20 @@ dbuf_dirty_compute_state(dbuf_dirty_state_t *dds)
 	ASSERT(newest == NULL || newest->dr_txg <= tx->tx_txg ||
 	    db->db.db_object == DMU_META_DNODE_OBJECT);
 
-	dds->insert_pt = NULL; /* Insert at head. */
+	dds->dds_insert_pt = NULL; /* Insert at head. */
 	for (dr = newest; dr != NULL && dr->dr_txg > tx->tx_txg;
 	    dr = list_next(&db->db_dirty_records, dr))
-		dds->insert_pt = dr;
+		dds->dds_insert_pt = dr;
 
 	if (dr != NULL && dr->dr_txg == tx->tx_txg)
-		dds->txg_dr = dr;
+		dds->dds_txg_dr = dr;
 
 	/*
 	 * Cache whether this TX already has a dirty record, so that upon exit,
 	 * additional work can be done after dropping the dbuf mutex.  This
 	 * information is useful elsewhere, too.
 	 */
-	dds->txg_already_dirty = (dds->txg_dr != NULL);
+	dds->dds_txg_already_dirty = (dds->dds_txg_dr != NULL);
 }
 
 static void dbuf_dirty_parent(dbuf_dirty_state_t *dds);
@@ -2001,20 +2002,21 @@ static void dbuf_dirty_parent(dbuf_dirty_state_t *dds);
 static void
 dbuf_dirty_exit(dbuf_dirty_state_t *dds)
 {
-	dmu_buf_impl_t *db = dds->db;
+	dmu_buf_impl_t *db = dds->dds_db;
+	dnode_t *dn = dds->dds_dn;
 	void *front = (db->db_blkid == DMU_BONUS_BLKID) ? db->db.db_data :
 	    db->db_buf;
 
-	ASSERT(db->db_level != 0 || dds->txg_dr->dt.dl.dr_data == front);
-	ASSERT3U(dds->txg_dr->dr_txg, ==, dds->tx->tx_txg);
+	ASSERT(db->db_level != 0 || dds->dds_txg_dr->dt.dl.dr_data == front);
+	ASSERT3U(dds->dds_txg_dr->dr_txg, ==, dds->dds_tx->tx_txg);
 
 	mutex_exit(&db->db_mtx);
 
-	if (!dds->txg_already_dirty) {
-		if (dds->do_free_accounting) {
+	if (!dds->dds_txg_already_dirty) {
+		if (dds->dds_do_free_accounting) {
 			/* NB: This only applies to non-SPILL/BONUS blocks. */
 			blkptr_t *bp = db->db_blkptr;
-			objset_t *os = dds->dn->dn_objset;
+			objset_t *os = dn->dn_objset;
 			int64_t willfree = (bp && !BP_IS_HOLE(bp)) ?
 			    bp_get_dsize(os->os_spa, bp) : db->db.db_size;
 			/*
@@ -2026,7 +2028,7 @@ dbuf_dirty_exit(dbuf_dirty_state_t *dds)
 			 * it's OK if we get an odd answer.
 			 */
 			ddt_prefetch(os->os_spa, bp);
-			dnode_willuse_space(dds->dn, -willfree, dds->tx);
+			dnode_willuse_space(dn, -willfree, dds->dds_tx);
 		}
 		dbuf_dirty_parent(dds);
 	}
@@ -2098,10 +2100,10 @@ dbuf_dirty_indirect(dmu_buf_impl_t *db, dmu_tx_t *tx)
 static void
 dbuf_dirty_parent(dbuf_dirty_state_t *dds)
 {
-	dnode_t *dn = dds->dn;
-	dmu_buf_impl_t *db = dds->db;
-	dmu_tx_t *tx = dds->tx;
-	dbuf_dirty_record_t *dr = dds->txg_dr;
+	dnode_t *dn = dds->dds_dn;
+	dmu_buf_impl_t *db = dds->dds_db;
+	dmu_tx_t *tx = dds->dds_tx;
+	dbuf_dirty_record_t *dr = dds->dds_txg_dr;
 
 	int drop_struct_lock = FALSE;
 	int txgoff = tx->tx_txg & TXG_MASK;
@@ -2284,28 +2286,28 @@ out:
 static void
 dbuf_dirty_set_data(dbuf_dirty_state_t *dds)
 {
-	arc_buf_t *buf = dds->fill_buf;
+	arc_buf_t *buf = dds->dds_fill_buf;
 	if (buf == NULL)
-		buf = dbuf_alloc_arcbuf(dds->db);
-	dbuf_set_data(dds->db, buf);
+		buf = dbuf_alloc_arcbuf(dds->dds_db);
+	dbuf_set_data(dds->dds_db, buf);
 }
 
 static void
 dbuf_dirty_leaf_with_existing_frontend(dbuf_dirty_state_t *dds)
 {
-	dmu_buf_impl_t *db = dds->db;
+	dmu_buf_impl_t *db = dds->dds_db;
 	int size = db->db.db_size;
 	dbuf_dirty_record_t *newest = list_head(&db->db_dirty_records);
-	boolean_t old_txg_is_frontend = !dds->txg_already_dirty &&
+	boolean_t old_txg_is_frontend = !dds->dds_txg_already_dirty &&
 	    newest != NULL && newest->dt.dl.dr_data == db->db_buf;
-	arc_buf_t *fill_buf = dds->fill_buf;
+	arc_buf_t *fill_buf = dds->dds_fill_buf;
 
 	ASSERT(fill_buf == NULL || fill_buf != db->db_buf);
 	ASSERT3U(refcount_count(&db->db_holds), >, db->db_dirtycnt);
 
 	/* Reset any immediate write that has occurred. */
-	if (dds->txg_already_dirty)
-		dbuf_unoverride(dds->txg_dr);
+	if (dds->dds_txg_already_dirty)
+		dbuf_unoverride(dds->dds_txg_dr);
 
 	/* If the old txg's record owns the frontend, give it its own copy. */
 	if (old_txg_is_frontend) {
@@ -2346,7 +2348,7 @@ dbuf_dirty_leaf_with_existing_frontend(dbuf_dirty_state_t *dds)
 
 	/* Frontend not owned by anybody.  Notify that it will be modified. */
 	ASSERT(newest == NULL || fill_buf == NULL);
-	if (dds->txg_already_dirty) {
+	if (dds->dds_txg_already_dirty) {
 		/* Already released on initial dirty, so just thaw. */
 		ASSERT(arc_released(db->db_buf));
 		arc_buf_thaw(db->db_buf);
@@ -2357,10 +2359,10 @@ dbuf_dirty_leaf_with_existing_frontend(dbuf_dirty_state_t *dds)
 static void
 dbuf_dirty_record_create_leaf(dbuf_dirty_state_t *dds)
 {
-	dmu_buf_impl_t *db = dds->db;
+	dmu_buf_impl_t *db = dds->dds_db;
 	dbuf_dirty_record_t *dr;
-	dnode_t *dn = dds->dn;
-	int txgoff = dds->tx->tx_txg & TXG_MASK;
+	dnode_t *dn = dds->dds_dn;
+	int txgoff = dds->dds_tx->tx_txg & TXG_MASK;
 
 	dr = dbuf_dirty_record_create(dds);
 
@@ -2370,12 +2372,12 @@ dbuf_dirty_record_create_leaf(dbuf_dirty_state_t *dds)
 	 * processed, so it can't be checked here.
 	 */
 	if (db->db_blkid != DMU_SPILL_BLKID) {
-		mutex_enter(&dds->dn->dn_mtx);
+		mutex_enter(&dds->dds_dn->dn_mtx);
 		if (dn->dn_free_ranges[txgoff] != NULL) {
 			range_tree_clear(dn->dn_free_ranges[txgoff],
 			    db->db_blkid, 1);
 		}
-		mutex_exit(&dds->dn->dn_mtx);
+		mutex_exit(&dds->dds_dn->dn_mtx);
 		db->db_freed_in_flight = FALSE;
 	}
 	dbuf_dirty_record_register_as_leaf(dds);
@@ -2384,7 +2386,7 @@ dbuf_dirty_record_create_leaf(dbuf_dirty_state_t *dds)
 static void
 dbuf_dirty_leaf_common(dbuf_dirty_state_t *dds)
 {
-	dmu_buf_impl_t *db = dds->db;
+	dmu_buf_impl_t *db = dds->dds_db;
 
 	if (db->db_buf == NULL)
 		dbuf_dirty_set_data(dds);
@@ -2392,20 +2394,20 @@ dbuf_dirty_leaf_common(dbuf_dirty_state_t *dds)
 		dbuf_dirty_leaf_with_existing_frontend(dds);
 	ASSERT(arc_released(db->db_buf) && arc_buf_frozen(db->db_buf, B_FALSE));
 
-	if (!dds->txg_already_dirty)
+	if (!dds->dds_txg_already_dirty)
 		dbuf_dirty_record_create_leaf(dds);
 	else
 		dbuf_dirty_record_update_leaf(dds);
 
 	if (db->db_state != DB_CACHED)
-		dbuf_dirty_record_add_range(dds->txg_dr, dds->offset,
-		    dds->size);
+		dbuf_dirty_record_add_range(dds->dds_txg_dr, dds->dds_offset,
+		    dds->dds_size);
 }
 
 dbuf_dirty_record_t *
 dbuf_dirty_record_create_bonus(dbuf_dirty_state_t *dds)
 {
-	dmu_buf_impl_t *db = dds->db;
+	dmu_buf_impl_t *db = dds->dds_db;
 	dbuf_dirty_record_t *newest = list_head(&db->db_dirty_records);
 	boolean_t last_txg_is_frontend = newest != NULL &&
 	    newest->dt.dl.dr_data == db->db.db_data;
@@ -2488,12 +2490,12 @@ dbuf_dirty_bonus(dmu_buf_impl_t *db, dmu_tx_t *tx)
 static void
 dbuf_dirty_handle_fault(dbuf_dirty_state_t *dds)
 {
-	dmu_buf_impl_t *db = dds->db;
+	dmu_buf_impl_t *db = dds->dds_db;
 
 	ASSERT0(db->db_level);
 	if (db->db_state & DB_PARTIAL) {
 		dbuf_dirty_record_t *dr = list_head(&db->db_dirty_records);
-		if (dr->dr_txg != dds->tx->tx_txg) {
+		if (dr->dr_txg != dds->dds_tx->tx_txg) {
 			/*
 			 * The newest dirty record's transaction group has
 			 * closed.  Since COW fault resolution can't be
@@ -2504,9 +2506,9 @@ dbuf_dirty_handle_fault(dbuf_dirty_state_t *dds)
 			dbuf_transition_to_read(db);
 		}
 	} else if (db->db_state == DB_UNCACHED) {
-		int write_end = dds->offset + dds->size;
+		int write_end = dds->dds_offset + dds->dds_size;
 
-		if (dds->offset != 0 && write_end != db->db.db_size) {
+		if (dds->dds_offset != 0 && write_end != db->db.db_size) {
 			/*
 			 * Immediately start resolving a COW fault if we start
 			 * writing inside the block rather than either at the
@@ -2514,14 +2516,14 @@ dbuf_dirty_handle_fault(dbuf_dirty_state_t *dds)
 			 * writes are unlikely to fill this dbuf.
 			 */
 			dbuf_transition_to_read(db);
-		} else if (dds->size != db->db.db_size) {
+		} else if (dds->dds_size != db->db.db_size) {
 			/*
 			 * If this dirty won't fill the buffer, see if a
 			 * previous version is in the ARC.  This skips the
 			 * partial buffer bookkeeping that would otherwise
 			 * be necessary.
 			 */
-			dbuf_read_cached(db, dds->dn);
+			dbuf_read_cached(db, dds->dds_dn);
 		}
 	}
 }
@@ -2535,8 +2537,8 @@ dbuf_dirty_leaf_enter(dbuf_dirty_state_t *dds,
 {
 
 	dbuf_dirty_enter(dds, db, tx);
-	dds->offset = offset;
-	dds->size = size;
+	dds->dds_offset = offset;
+	dds->dds_size = size;
 	/*
 	 * Handle COW faults prior to computing the dirty state, since
 	 * transitioning to read drops the lock.
