@@ -529,10 +529,6 @@ dbuf_verify(dmu_buf_impl_t *db)
 		}
 	}
 
-	/* Some dbufs can't have buffer sets. */
-	ASSERT(db->db_blkid != DMU_BONUS_BLKID ||
-	    list_is_empty(&db->db_buf_sets));
-
 	/* Dbuf state checks. */
 	/* If a dbuf is partial, it can only have one dirty record. */
 	ASSERT((db->db_state & DB_PARTIAL) == 0 || db->db_dirtycnt == 1);
@@ -879,19 +875,6 @@ dbuf_resolve_ranges(dmu_buf_impl_t *db, arc_buf_t *buf)
 }
 
 static void
-dbuf_process_buf_sets(dmu_buf_impl_t *db, int err)
-{
-	dmu_buf_set_node_t *dbsn, *next;
-
-	ASSERT(db->db_buf != NULL || err);
-	for (dbsn = list_head(&db->db_buf_sets); dbsn != NULL; dbsn = next) {
-		next = list_next(&db->db_buf_sets, dbsn);
-		dmu_buf_set_rele(dbsn->dbsn_dbs, err);
-		dmu_buf_set_node_remove(&db->db_buf_sets, dbsn);
-	}
-}
-
-static void
 dbuf_read_complete(dmu_buf_impl_t *db, arc_buf_t *buf, boolean_t is_hole_read)
 {
 	dbuf_dirty_record_t *oldest_dr = list_tail(&db->db_dirty_records);
@@ -957,7 +940,6 @@ dbuf_read_complete(dmu_buf_impl_t *db, arc_buf_t *buf, boolean_t is_hole_read)
 		ASSERT(db->db_buf != NULL);
 		arc_discard_buf(buf, db);
 	}
-	dbuf_process_buf_sets(db, /*err*/0);
 }
 
 static void
@@ -996,7 +978,6 @@ dbuf_read_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 			ASSERT3P(db->db_buf, ==, NULL);
 			db->db_state = DB_UNCACHED;
 			DBUF_STATE_CHANGE(db, =, DB_UNCACHED, "read failed");
-			dbuf_process_buf_sets(db, zio->io_error);
 		}
 		VERIFY(arc_buf_remove_ref(buf, db));
 	}
@@ -1554,7 +1535,6 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 		bzero(db->db.db_data, db->db.db_size);
 		arc_buf_freeze(db->db_buf);
 		DBUF_STATE_CHANGE(db, =, DB_CACHED, "zeroed by free");
-		dbuf_process_buf_sets(db, /*err*/0);
 		cv_broadcast(&db->db_changed);
 		mutex_exit(&db->db_mtx);
 	}
@@ -3037,7 +3017,6 @@ dbuf_fill_done(dmu_buf_impl_t *db, dmu_tx_t *tx)
 			dbuf_dirty_record_cleanup_ranges(dr);
 			DBUF_STATE_CHANGE(db, =, DB_CACHED,
 			    "fill done handling freed in flight");
-			dbuf_process_buf_sets(db, /*err*/0);
 		} else {
 			/*
 			 * This function can be called with another state bit
@@ -3048,7 +3027,6 @@ dbuf_fill_done(dmu_buf_impl_t *db, dmu_tx_t *tx)
 			if (db->db_state == DB_FILL) {
 				DBUF_STATE_CHANGE(db, =, DB_CACHED,
 				    "filler finished, complete buffer");
-				dbuf_process_buf_sets(db, /*err*/0);
 			} else {
 				DBUF_STATE_CHANGE(db, &=, ~DB_FILL,
 				    "filler finished, incomplete buffer");
@@ -3305,9 +3283,6 @@ dbuf_create(dnode_t *dn, uint8_t level, uint64_t blkid,
 	list_create(&db->db_dirty_records, sizeof (dbuf_dirty_record_t),
 	    offsetof(dbuf_dirty_record_t, db_dirty_record_link));
 
-	list_create(&db->db_buf_sets, sizeof (dmu_buf_set_node_t),
-	    offsetof(dmu_buf_set_node_t, dbsn_link));
-
 	db->db_objset = os;
 	db->db.db_object = dn->dn_object;
 	db->db_level = level;
@@ -3436,7 +3411,6 @@ dbuf_destroy(dmu_buf_impl_t *db)
 	db->db_parent = NULL;
 	db->db_buf = NULL;
 	list_destroy(&db->db_dirty_records);
-	list_destroy(&db->db_buf_sets);
 
 	ASSERT(db->db.db_data == NULL);
 	ASSERT(db->db_hash_next == NULL);
@@ -3657,7 +3631,7 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 int
 dbuf_hold_impl(dnode_t *dn, uint8_t level, uint64_t blkid,
     boolean_t fail_sparse, boolean_t fail_uncached,
-    void *tag, dmu_buf_impl_t **dbp, dmu_buf_set_t *dbs)
+    void *tag, dmu_buf_impl_t **dbp)
 {
 	dmu_buf_impl_t *db, *parent = NULL;
 
@@ -3732,14 +3706,6 @@ top:
 
 	(void) refcount_add(&db->db_holds, tag);
 	DBUF_VERIFY(db);
-	/* If a reading buffer set is associated, add the callback now. */
-	if (dbs != NULL && (dbs->dbs_dc->dc_flags & DMU_CTX_FLAG_READ)) {
-		if (db->db_state == DB_CACHED) {
-			/* Dbuf is already at the desired state. */
-			dmu_buf_set_rele(dbs, /*err*/0);
-		} else
-			dmu_buf_set_node_add(&db->db_buf_sets, dbs);
-	}
 	mutex_exit(&db->db_mtx);
 
 	/* NOTE: we can't rele the parent until after we drop the db_mtx */
