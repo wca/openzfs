@@ -3215,9 +3215,7 @@ dbuf_findbp(dnode_t *dn, int level, uint64_t blkid, int fail_sparse,
 		mutex_enter(&dn->dn_mtx);
 		/* Make sure the spill BP is valid before sending it up. */
 		if (dn->dn_have_spill &&
-		    (dn->dn_phys->dn_flags & DNODE_FLAG_SPILL_BLKPTR) &&
-		    zfs_blkptr_verify(dn->dn_objset->os_spa,
-				      &dn->dn_phys->dn_spill) == 0)
+		    (dn->dn_phys->dn_flags & DNODE_FLAG_SPILL_BLKPTR))
 			*bpp = &dn->dn_phys->dn_spill;
 		dbuf_add_ref(dn->dn_dbuf, NULL);
 		*parentp = dn->dn_dbuf;
