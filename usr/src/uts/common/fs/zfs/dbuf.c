@@ -129,7 +129,7 @@ dbuf_hash(void *os, uint64_t obj, uint8_t lvl, uint64_t blkid)
 	(db)->db_state op state;					\
 	DTRACE_PROBE2(dbuf__state_change, dmu_buf_impl_t *, db,		\
 	    const char *, why);						\
-} while(0)
+} while (0)
 
 #define	DBUF_HASH(os, obj, level, blkid) dbuf_hash(os, obj, level, blkid);
 
@@ -298,7 +298,7 @@ dbuf_verify_user(dmu_buf_impl_t *db, dbvu_verify_type_t verify_type)
 static void
 dbuf_evict_user(dmu_buf_impl_t *db)
 {
- 	dmu_buf_user_t *dbu = db->db_user;
+	dmu_buf_user_t *dbu = db->db_user;
 
 	ASSERT(MUTEX_HELD(&db->db_mtx));
 
@@ -306,7 +306,7 @@ dbuf_evict_user(dmu_buf_impl_t *db)
 		return;
 
 	dbuf_verify_user(db, DBVU_EVICTING);
- 	db->db_user = NULL;
+	db->db_user = NULL;
 
 #ifdef ZFS_DEBUG
 	if (dbu->dbu_clear_on_evict_dbufp != NULL)
@@ -995,7 +995,7 @@ dbuf_read_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 			 * Limit our losses to just the data we can't
 			 * read by filling any holes in our dirty records
 			 * with zeros.
-			 */ 
+			 */
 			bzero(buf->b_data, arc_buf_size(buf));
 			arc_buf_freeze(buf);
 			dbuf_read_complete(db, buf, /*is_hole_read*/B_FALSE);
@@ -1022,7 +1022,7 @@ dbuf_read_bonus(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
 	int bonuslen = MIN(dn->dn_bonuslen, dn->dn_phys->dn_bonuslen);
 
 	if (db->db_blkid != DMU_BONUS_BLKID)
-		return B_FALSE;
+		return (B_FALSE);
 
 	ASSERT(MUTEX_HELD(&db->db_mtx));
 	ASSERT(DB_DNODE_HELD(db));
@@ -1031,7 +1031,7 @@ dbuf_read_bonus(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
 	arc_space_consume(DN_MAX_BONUSLEN, ARC_SPACE_OTHER);
 	if (bonuslen < DN_MAX_BONUSLEN)
 		bzero(db->db.db_data, DN_MAX_BONUSLEN);
-	if (bonuslen)
+	if (bonuslen != 0)
 		bcopy(DN_BONUS(dn->dn_phys), db->db.db_data, bonuslen);
 	DBUF_STATE_CHANGE(db, =, DB_CACHED, "bonus buffer filled");
 	return (B_TRUE);
@@ -1515,7 +1515,7 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 		 * not the case, it can lead to performance problems,
 		 * so note that we unexpectedly took the slow path.
 		 */
-		 atomic_inc_64(&zfs_free_range_recv_miss);
+		atomic_inc_64(&zfs_free_range_recv_miss);
 	}
 
 	db = avl_find(&dn->dn_dbufs, &db_search, &where);
@@ -1528,7 +1528,7 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 		db_next = AVL_NEXT(&dn->dn_dbufs, db);
 		ASSERT(db->db_blkid != DMU_BONUS_BLKID);
 
-		if (!freespill && 
+		if (!freespill &&
 		    (db->db_level != 0 || db->db_blkid > end_blkid)) {
 			break;
 		}
@@ -1542,7 +1542,7 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 		}
 
 		dr = list_head(&db->db_dirty_records);
-		if (dr && dr->dr_txg != tx->tx_txg)
+		if (dr != NULL && dr->dr_txg != tx->tx_txg)
 			dr = NULL;
 		DBUF_VERIFY(db);
 		if (dbuf_free_range_already_freed(db) ||
@@ -1882,7 +1882,7 @@ static void
 dbuf_dirty_record_create_nofill(dbuf_dirty_state_t *dds)
 {
 	dbuf_dirty_record_t *dr;
-	
+
 	(void) dbuf_dirty_record_create(dds);
 	dbuf_dirty_record_register_as_leaf(dds);
 }
@@ -2360,7 +2360,7 @@ dbuf_dirty_record_create_leaf(dbuf_dirty_state_t *dds)
 	dmu_buf_impl_t *db = dds->db;
 	dbuf_dirty_record_t *dr;
 	dnode_t *dn = dds->dn;
-	int txgoff = dds->tx->tx_txg & TXG_MASK; 
+	int txgoff = dds->tx->tx_txg & TXG_MASK;
 
 	dr = dbuf_dirty_record_create(dds);
 
@@ -3249,7 +3249,7 @@ dbuf_findbp(dnode_t *dn, int level, uint64_t blkid, int fail_sparse,
 		/* Make sure the spill BP is valid before sending it up. */
 		if (dn->dn_have_spill &&
 		    (dn->dn_phys->dn_flags & DNODE_FLAG_SPILL_BLKPTR) &&
-		    zfs_blkptr_verify(dn->dn_objset->os_spa, 
+		    zfs_blkptr_verify(dn->dn_objset->os_spa,
 				      &dn->dn_phys->dn_spill) == 0)
 			*bpp = &dn->dn_phys->dn_spill;
 		dbuf_add_ref(dn->dn_dbuf, NULL);
@@ -3985,7 +3985,7 @@ dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag)
 				db->db_is_ephemeral = B_TRUE;
 				dbuf_clear(db);
 			} else if (db->db_pending_evict ||
-	  		    arc_buf_eviction_needed(db->db_buf) ||
+			    arc_buf_eviction_needed(db->db_buf) ||
 			    db->db_advice == POSIX_FADV_DONTNEED) {
 				dbuf_clear(db);
 			} else {
