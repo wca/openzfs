@@ -3859,9 +3859,6 @@ dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag)
 		dbuf_evict_user(db);
 
 	if (holds == 0) {
-		if (db->db_advice == POSIX_FADV_WILLNEED)
-			db->db_advice = 0;
-
 		if (db->db_blkid == DMU_BONUS_BLKID) {
 			dnode_t *dn;
 			boolean_t evict_dbuf = db->db_pending_evict;
@@ -3940,8 +3937,7 @@ dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag)
 				db->db_is_ephemeral = B_TRUE;
 				dbuf_clear(db);
 			} else if (db->db_pending_evict ||
-			    arc_buf_eviction_needed(db->db_buf) ||
-			    db->db_advice == POSIX_FADV_DONTNEED) {
+			    arc_buf_eviction_needed(db->db_buf)) {
 				dbuf_clear(db);
 			} else {
 				mutex_exit(&db->db_mtx);
