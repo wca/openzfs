@@ -1433,7 +1433,7 @@ fail:
 
 /* read-holding callers must not rely on the lock being continuously held */
 void
-dnode_new_blkid(dnode_t *dn, uint64_t blkid, dmu_tx_t *tx, int have_read)
+dnode_new_blkid(dnode_t *dn, uint64_t blkid, dmu_tx_t *tx, boolean_t have_read)
 {
 	uint64_t txgoff = tx->tx_txg & TXG_MASK;
 	int epbs, new_nlevels;
