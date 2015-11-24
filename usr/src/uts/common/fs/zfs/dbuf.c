@@ -990,7 +990,7 @@ dbuf_read_done(zio_t *zio, arc_buf_t *buf, void *vdb)
  * was taken.
  */
 static boolean_t
-dbuf_read_bonus(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
+dbuf_read_bonus(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
 {
 	int bonuslen = MIN(dn->dn_bonuslen, dn->dn_phys->dn_bonuslen);
 
@@ -1016,7 +1016,7 @@ dbuf_read_bonus(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
  * drops the mutex.  Returns whether any action was taken.
  */
 static boolean_t
-dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
+dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
 {
 	int is_hole;
 
@@ -1056,29 +1056,14 @@ dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t *flags)
 	return (B_FALSE);
 }
 
-static void
-dbuf_read_cached_done(zio_t *zio, arc_buf_t *buf, void *priv)
-{
-	dmu_buf_impl_t *db = (dmu_buf_impl_t *)priv;
-
-	if (buf != NULL) {
-		ASSERT(arc_buf_frozen(buf, B_TRUE) && !arc_released(buf));
-		db->db_state = DB_READ; /* for read_complete */
-		dbuf_read_complete(db, buf, /*is_hole_read*/B_FALSE);
-	}
-}
-
 /*
  * Actually read (or issue I/O for) a dbuf's block.
  *
  * Flags will be modified to include DB_RF_CACHED if the call returns with
  * the dbuf cached.
- *
- * The DB_RF_CACHED_ONLY flag has the effect of performing a cached-only
- * read.  Only in this case will the dbuf mutex be retained.
  */
 static void
-dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t *flags)
+dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 {
 	dnode_t *dn;
 	zbookmark_phys_t zb;
@@ -1092,25 +1077,6 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t *flags)
 
 	if (dbuf_read_bonus(db, dn, flags) || dbuf_read_hole(db, dn, flags)) {
 		DB_DNODE_EXIT(db);
-		*flags |= DB_RF_CACHED;
-		if ((*flags & DB_RF_CACHED_ONLY) == 0)
-			mutex_exit(&db->db_mtx);
-		return;
-	}
-
-	/* Check to see if a caller only wants cached buffers. */
-	if (*flags & DB_RF_CACHED_ONLY) {
-		ASSERT(db->db_state == DB_UNCACHED && db->db_buf == NULL &&
-		    db->db_dirtycnt == 0);
-		aflags = ARC_CACHED_ONLY;
-		(void) arc_read(/*pio*/NULL, dn->dn_objset->os_spa,
-		    db->db_blkptr, dbuf_read_cached_done, db, /*priority*/0,
-		    /*zio_flags*/0, &aflags, /*zb*/NULL);
-
-		if (aflags & ARC_CACHED)
-			*flags |= DB_RF_CACHED;
-		DB_DNODE_EXIT(db);
-		/* Cache lookups never drop the dbuf mutex. */
 		return;
 	}
 
@@ -1139,33 +1105,8 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t *flags)
 
 	(void) arc_read(zio, db->db_objset->os_spa, db->db_blkptr,
 	    dbuf_read_done, db, ZIO_PRIORITY_SYNC_READ,
-	    (*flags & DB_RF_CANFAIL) ? ZIO_FLAG_CANFAIL : ZIO_FLAG_MUSTSUCCEED,
+	    (flags & DB_RF_CANFAIL) ? ZIO_FLAG_CANFAIL : ZIO_FLAG_MUSTSUCCEED,
 	    &aflags, &zb);
-	if (aflags & ARC_CACHED)
-		*flags |= DB_RF_CACHED;
-}
-
-/*
- * Find a dbuf's block in the ARC, if it's there.  Calling this is equivalent
- * to calling dbuf_read, but only if the block is already in the cache.
- *
- * This function only applies to level 0 blocks, and requires the dbuf mutex.
- * Returns whether an ARC hit occurred.
- */
-static boolean_t
-dbuf_read_cached(dmu_buf_impl_t *db, dnode_t *dn)
-{
-	int rflags = DB_RF_CACHED_ONLY;
-	boolean_t held = RW_WRITE_HELD(&dn->dn_struct_rwlock);
-
-	ASSERT(DB_DNODE_HELD(db));
-
-	/* Make sure read_impl doesn't change its contract with us. */
-	ASSERT(MUTEX_HELD(&db->db_mtx));
-	dbuf_read_impl(db, NULL, &rflags);
-	ASSERT(MUTEX_HELD(&db->db_mtx));
-
-	return ((rflags & DB_RF_CACHED) != 0);
 }
 
 int
@@ -2484,14 +2425,6 @@ dbuf_dirty_handle_fault(dbuf_dirty_state_t *dds)
 			 * writes are unlikely to fill this dbuf.
 			 */
 			dbuf_transition_to_read(db);
-		} else if (dds->dds_size != db->db.db_size) {
-			/*
-			 * If this dirty won't fill the buffer, see if a
-			 * previous version is in the ARC.  This skips the
-			 * partial buffer bookkeeping that would otherwise
-			 * be necessary.
-			 */
-			dbuf_read_cached(db, dds->dds_dn);
 		}
 	}
 }
