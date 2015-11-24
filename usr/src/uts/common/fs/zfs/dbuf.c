@@ -2806,9 +2806,10 @@ dmu_buf_will_dirty(dmu_buf_t *db_fake, dmu_tx_t *tx)
 	 * cached).
 	 */
 	mutex_enter(&db->db_mtx);
-	dbuf_dirty_record_t *dr;
-	for (dr = db->db_last_dirty;
-	    dr != NULL && dr->dr_txg >= tx->tx_txg; dr = dr->dr_next) {
+	dbuf_dirty_record_t *dr, *dr_next;
+	for (dr = list_head(&db->db_dirty_records); dr != NULL; dr = dr_next) {
+		dr_next = list_next(&db->db_dirty_records, dr);
+
 		/*
 		 * It's possible that it is already dirty but not cached,
 		 * because there are some calls to dbuf_dirty() that don't
