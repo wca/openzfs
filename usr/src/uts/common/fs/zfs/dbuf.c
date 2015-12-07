@@ -528,29 +528,6 @@ dbuf_verify(dmu_buf_impl_t *db)
 			}
 		}
 	}
-
-	/* Dbuf state checks. */
-	/* If a dbuf is partial, it can only have one dirty record. */
-	ASSERT((db->db_state & DB_PARTIAL) == 0 || db->db_dirtycnt == 1);
-
-	/*
-	 * Returns 1 if either the bitmask is not set or those are the only
-	 * bits set, with exceptions where they are acceptable.
-	 */
-#define BITMASK_SET(val, bitmask, exceptions)				\
-	(((val) & (bitmask)) == 0 || ((val) & (~(bitmask|exceptions))) == 0)
-#define BITMASK_SET_EXCLUSIVE(val, bitmask) BITMASK_SET(val, bitmask, 0)
-
-	ASSERT(BITMASK_SET_EXCLUSIVE(db->db_state, DB_UNCACHED));
-	ASSERT(BITMASK_SET_EXCLUSIVE(db->db_state, DB_NOFILL));
-	ASSERT(BITMASK_SET_EXCLUSIVE(db->db_state, DB_CACHED));
-	ASSERT(BITMASK_SET_EXCLUSIVE(db->db_state, DB_EVICTING));
-	ASSERT(BITMASK_SET(db->db_state, DB_PARTIAL, DB_FILL));
-	ASSERT(BITMASK_SET(db->db_state, DB_READ, DB_FILL));
-	ASSERT(BITMASK_SET(db->db_state, DB_FILL, (DB_PARTIAL|DB_READ)));
-#undef BITMASK_SET_EXCLUSIVE
-#undef BITMASK_SET
-
 	DB_DNODE_EXIT(db);
 }
 #endif
@@ -665,82 +642,6 @@ dbuf_whichblock(dnode_t *dn, int64_t level, uint64_t offset)
 	}
 }
 
-typedef struct dbuf_dirty_record_hole {
-	caddr_t src;
-	caddr_t dst;
-	int size;
-} dbuf_dirty_record_hole_t;
-
-typedef struct dbuf_dirty_record_hole_itr {
-	/* provided data */
-	arc_buf_t *src;
-	dbuf_dirty_leaf_record_t *dl;
-	/* calculated data */
-	dbuf_dirty_range_t *range;
-	/* One greater than the last valid offset in the dst buffer */
-	int max_offset;
-	int hole_start;
-	dbuf_dirty_record_hole_t hole;
-} dbuf_dirty_record_hole_itr_t;
-
-/*
- * Initialize a dirty record hole iterator for the given dirty leaf dbuf.
- * src_buf must be the initial buffer.
- */
-static inline void
-dbuf_dirty_record_hole_itr_init(dbuf_dirty_record_hole_itr_t *itr,
-    dbuf_dirty_leaf_record_t *dl, arc_buf_t *src_buf)
-{
-	itr->src = src_buf;
-	itr->dl = dl;
-	itr->max_offset = MIN(arc_buf_size(src_buf), arc_buf_size(dl->dr_data));
-	itr->range = list_head(&dl->write_ranges);
-	ASSERT(arc_buf_frozen(dl->dr_data, B_FALSE));
-	itr->hole.src = NULL;
-	itr->hole.dst = NULL;
-	itr->hole.size = 0;
-	/* If no ranges exist, the dirty buffer is entirely valid. */
-	if (itr->range == NULL) {
-		/* Set to the end to return no holes */
-		itr->hole_start = itr->max_offset;
-	} else if (itr->range->start == 0) {
-		itr->hole_start = itr->range->size;
-		itr->range = list_next(&itr->dl->write_ranges, itr->range);
-	} else
-		itr->hole_start = 0;
-}
-
-/*
- * Iterate a dirty record, providing the next hole.
- *
- * The hole returned provides direct pointers to the source, destination,
- * and the target size.  A hole is a portion of the dirty record's ARC
- * buffer that does not contain valid data and must be filled in using the
- * initial ARC buffer, which should be entirely valid.
- *
- * Returns NULL If there are no more holes.
- */
-static inline dbuf_dirty_record_hole_t *
-dbuf_dirty_record_hole_itr_next(dbuf_dirty_record_hole_itr_t *itr)
-{
-
-	if (itr->hole_start >= itr->max_offset)
-		return (NULL);
-
-	itr->hole.src = (caddr_t)(itr->src->b_data) + itr->hole_start;
-	itr->hole.dst = (caddr_t)(itr->dl->dr_data->b_data) + itr->hole_start;
-	if (itr->range != NULL) {
-		itr->hole.size = MIN(itr->max_offset, itr->range->start) -
-		    itr->hole_start;
-		itr->hole_start = itr->range->end;
-		itr->range = list_next(&itr->dl->write_ranges, itr->range);
-	} else {
-		itr->hole.size = itr->max_offset - itr->hole_start;
-		itr->hole_start = itr->max_offset;
-	}
-	return (&itr->hole);
-}
-
 /*
  * Perform any dbuf arc buffer splits required to guarantee
  * the syncer operates on a stable buffer.  The buffer is provided
@@ -794,128 +695,11 @@ dbuf_syncer_split(dmu_buf_impl_t *db, dbuf_dirty_record_t *syncer_dr,
 	}
 }
 
-/*
- * Merge write ranges for a dirty record, using buf to fill any holes.
- *
- * This function performs an inverse merge.  The write ranges provided
- * indicate valid data in the dirty leaf's buffer, which means the old
- * buffer has to be copied over exclusive of those ranges.
- */
 static void
-dbuf_merge_write_ranges(dbuf_dirty_leaf_record_t *dl, arc_buf_t *old_buf)
+dbuf_read_complete(dmu_buf_impl_t *db, arc_buf_t *buf)
 {
-	dbuf_dirty_record_hole_itr_t itr;
-	dbuf_dirty_record_hole_t *hole;
 
-	ASSERT3P(dl, !=, NULL);
-	/* If there are no write ranges, we're done. */
-	if (list_is_empty(&dl->write_ranges))
-		return;
-	/* If there are write ranges, there must be an ARC buffer. */
-	ASSERT(dl->dr_data != NULL);
-
-	/*
-	 * We use an iterator here because it simplifies the logic
-	 * considerably for this function.
-	 */
-	dbuf_dirty_record_hole_itr_init(&itr, dl, old_buf);
-
-	while ((hole = dbuf_dirty_record_hole_itr_next(&itr)) != NULL)
-		memcpy(hole->dst, hole->src, hole->size);
-}
-
-/*
- * Resolve a dbuf using its ranges and the filled ARC buffer provided.
- *
- * This routine is called after a read completes.  The results of the read
- * are stored in the ARC buffer.  It will then merge writes in the order
- * that they occurred, cleaning up write ranges as it goes.
- */
-static void
-dbuf_resolve_ranges(dmu_buf_impl_t *db, arc_buf_t *buf)
-{
-	dbuf_dirty_record_t *dr;
-	dbuf_dirty_leaf_record_t *dl;
-	arc_buf_t *old_buf;
-
-	/* No range data is kept for non data blocks. */
-	ASSERT0(db->db_level);
-
-	/*
-	 * Start with the oldest dirty record, merging backwards.  For the
-	 * first dirty record, the provided ARC buffer is the "old" buffer.
-	 *
-	 * In turn, the older buffer is copied to the newer one, using an
-	 * inverse of the newer one's write ranges.
-	 */
-	dr = list_tail(&db->db_dirty_records);
-	old_buf = buf;
-	while (dr != NULL) {
-		dl = &dr->dt.dl;
-		ASSERT(dl->dr_data);
-		dbuf_merge_write_ranges(dl, old_buf);
-		/*
-		 * Now that we have updated the buffer, freeze it.  However,
-		 * if the FILL bit is set, someone else is actively
-		 * modifying the current buffer, and will be responsible for
-		 * freezing that buffer.
-		 */
-		if (dl->dr_data != db->db_buf || !(db->db_state & DB_FILL))
-			arc_buf_freeze(dl->dr_data);
-		dbuf_dirty_record_cleanup_ranges(dr);
-		old_buf = dl->dr_data;
-		dr = list_prev(&db->db_dirty_records, dr);
-	}
-
-	/*
-	 * Process any deferred syncer splits now that the buffer contents
-	 * are fully valid.
-	 */
-	dbuf_syncer_split(db, db->db_data_pending, /*deferred_split*/B_TRUE);
-}
-
-static void
-dbuf_read_complete(dmu_buf_impl_t *db, arc_buf_t *buf, boolean_t is_hole_read)
-{
-	dbuf_dirty_record_t *oldest_dr = list_tail(&db->db_dirty_records);
-
-	if (db->db_level == 0 && oldest_dr != NULL && !is_hole_read &&
-	    !list_is_empty(&oldest_dr->dt.dl.write_ranges)) {
-		/*
-		 * Fill any holes in the dbuf's dirty records with the
-		 * original block we read from disk.
-		 *
-		 * NOTE: A resolving read can be outstanding for older
-		 *	 TXGs at the same time a read completes to satisfy
-		 *	 a foreground reader or writer calling
-		 *	 dbuf_read_cached().  This only happens when the
-		 *	 dbuf has transitioned to DB_UNCACHED via
-		 *	 dbuf_free_range().  These foreground operations are
-		 *	 always satisfied via dbuf_read_hole(), which sets
-		 *	 is_hole_read to prevent foreground operations from
-		 *	 mistakenly filling holes in older TXGs.
-		 */
-
-		dbuf_resolve_ranges(db, buf);
-
-		if (db->db_state == DB_READ) {
-			DBUF_STATE_CHANGE(db, =, DB_CACHED,
-			    "resolve of records with only READ set");
-		} else if (db->db_state & DB_READ) {
-			ASSERT(db->db_state == (DB_READ|DB_FILL));
-			DBUF_STATE_CHANGE(db, &=, ~DB_READ,
-			    "resolve of records with READ state bit set");
-		}
-
-		arc_discard_buf(buf, db);
-
-		if (oldest_dr->dr_zio) {
-			ASSERT(oldest_dr == db->db_data_pending);
-			zio_nowait(oldest_dr->dr_zio);
-			DEBUG_COUNTER_INC(syncer_deferred_write_zios);
-		}
-		DEBUG_COUNTER_INC(resolves_completed);
-	} else if (db->db_state == DB_READ) {
+	if (db->db_state == DB_READ) {
 		/*
 		 * Read with no dirty data.  Use the buffer we
 		 * read and transition to DB_CACHED.
@@ -959,7 +743,7 @@ dbuf_read_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 
 	if (zio == NULL || zio->io_error == 0) {
 		/* Read succeeded. */
-		dbuf_read_complete(db, buf, /*is_hole_read*/B_FALSE);
+		dbuf_read_complete(db, buf);
 	} else {
 		/* Read failed. */
 		if (db->db_dirtycnt > 0) {
@@ -972,7 +756,7 @@ dbuf_read_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 			 */
 			bzero(buf->b_data, arc_buf_size(buf));
 			arc_buf_freeze(buf);
-			dbuf_read_complete(db, buf, /*is_hole_read*/B_FALSE);
+			dbuf_read_complete(db, buf);
 			atomic_add_64(&dirty_writes_lost, 1);
 		} else {
 			ASSERT3P(db->db_buf, ==, NULL);
@@ -1028,7 +812,7 @@ dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
 	 */
 	if (db->db_state != DB_UNCACHED) {
 		ASSERT(db->db_level == 0);
-		ASSERT(db->db_state & (DB_PARTIAL|DB_FILL|DB_READ));
+		ASSERT(db->db_state & (DB_FILL|DB_READ));
 		ASSERT(db->db_dirtycnt > 0);
 		return (B_FALSE);
 	}
@@ -1050,7 +834,7 @@ dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
 		buf = dbuf_alloc_arcbuf(db);
 		bzero(buf->b_data, db->db.db_size);
 		DBUF_STATE_CHANGE(db, =, DB_READ, "hole read satisfied");
-		dbuf_read_complete(db, buf, /*is_hole_read*/B_TRUE);
+		dbuf_read_complete(db, buf);
 		return (B_TRUE);
 	}
 	return (B_FALSE);
@@ -1073,7 +857,7 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 	dn = DB_DNODE(db);
 	ASSERT(!refcount_is_zero(&db->db_holds));
 	ASSERT(MUTEX_HELD(&db->db_mtx));
-	ASSERT(db->db_state == DB_UNCACHED || (db->db_state & DB_PARTIAL));
+	ASSERT(db->db_state == DB_UNCACHED);
 
 	if (dbuf_read_bonus(db, dn, flags) || dbuf_read_hole(db, dn, flags)) {
 		DB_DNODE_EXIT(db);
@@ -1143,7 +927,7 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		if ((flags & DB_RF_HAVESTRUCT) == 0)
 			rw_exit(&dn->dn_struct_rwlock);
 		DB_DNODE_EXIT(db);
-	} else if (db->db_state & (DB_UNCACHED|DB_PARTIAL)) {
+	} else if (db->db_state == DB_UNCACHED) {
 		spa_t *spa = dn->dn_objset->os_spa;
 
 		if (zio == NULL)
@@ -1268,21 +1052,7 @@ dbuf_free_range_disassociate_frontend(dmu_buf_impl_t *db, dnode_t *dn,
 			dn->dn_maxblkid = db->db_blkid;
 		/* Handle intermediate dmu_sync() calls. */
 		dbuf_unoverride(dr);
-
-		/*
-		 * If this buffer is still waiting on data for a RMW merge, that
-		 * data no longer applies to this buffer.  Transition to cached.
-		 */
-		dbuf_dirty_record_cleanup_ranges(dr);
 	} else {
-		if (db->db_state & DB_PARTIAL) {
-			/*
-			 * Schedule resolution for the older transaction
-			 * group's dirty record before we change the dbuf's
-			 * state and lose track of the PARTIAL state.
-			 */
-			dbuf_transition_to_read(db);
-		}
 		/* Disassociate the frontend if necessary. */
 		if (dr->dt.dl.dr_data == db->db_buf) {
 			arc_buf_t *buf;
@@ -1519,37 +1289,6 @@ dbuf_block_freeable(dmu_buf_impl_t *db)
 		return (B_FALSE);
 }
 
-static void
-dbuf_dirty_record_truncate_ranges(dbuf_dirty_record_t *dr, int new_size)
-{
-	dbuf_dirty_leaf_record_t *dl;
-	dbuf_dirty_range_t *range;
-
-	ASSERT(MUTEX_HELD(&dr->dr_dbuf->db_mtx));
-	if (dr->dr_dbuf->db_level != 0)
-		return;
-
-	dl = &dr->dt.dl;
-	for (;;) {
-		range = list_tail(&dl->write_ranges);
-
-		if (range->start >= new_size) {
-			list_remove(&dl->write_ranges, range);
-			kmem_free(range, sizeof (dbuf_dirty_range_t));
-			continue;
-		}
-
-		/*
-		 * Update the last range that could be affected by
-		 * this truncation.  Its size changes only if it
-		 * extends past the end of the buffer's new size.
-		 */
-		range->end = MIN(new_size, range->end);
-		range->size = range->end - range->size;
-		break;
-	}
-}
-
 void
 dbuf_new_size(dmu_buf_impl_t *db, int size, dmu_tx_t *tx)
 {
@@ -1783,8 +1522,6 @@ dbuf_dirty_record_register_as_leaf(dbuf_dirty_state_t *dds)
 
 	dbuf_dirty_record_update_leaf(dds);
 	dprintf_dbuf(db, "%s: dr_data=%p\n", __func__, dr->dt.dl.dr_data);
-	list_create(&dr->dt.dl.write_ranges, sizeof (dbuf_dirty_range_t),
-	    offsetof(dbuf_dirty_range_t, write_range_link));
 	dbuf_dirty_record_register(dds);
 }
 
@@ -2103,96 +1840,6 @@ dbuf_dirty_parent(dbuf_dirty_state_t *dds)
 }
 
 static void
-dbuf_dirty_record_check_ranges(dbuf_dirty_record_t *dr)
-{
-#ifdef ZFS_DEBUG
-	dbuf_dirty_leaf_record_t *dl;
-	dbuf_dirty_range_t *prev, *cur, *next;
-
-	if (!(zfs_flags & ZFS_DEBUG_DBUF_VERIFY))
-		return;
-
-	dl = &dr->dt.dl;
-
-	prev = next = NULL;
-	for (cur = list_head(&dl->write_ranges); cur != NULL;
-	    prev = cur, cur = next) {
-		next = list_next(&dl->write_ranges, cur);
-		ASSERT(prev == NULL || cur->start > prev->end);
-		ASSERT(next == NULL || cur->end < next->start);
-	}
-#endif
-}
-
-/*
- * Record a write range for the associated dirty record.
- */
-static void
-dbuf_dirty_record_add_range(dbuf_dirty_record_t *dr, int offset, int size)
-{
-	dbuf_dirty_range_t *next_range, *old_range, *range;
-	dbuf_dirty_leaf_record_t *dl;
-	dmu_buf_impl_t *db;
-
-	dl = &dr->dt.dl;
-	db = dr->dr_dbuf;
-
-	/* Write ranges do not apply to indirect blocks. */
-	ASSERT0(db->db_level);
-	ASSERT(MUTEX_HELD(&db->db_mtx));
-
-	/* Optimization: clear the ranges if the incoming range fills. */
-	if (offset == 0 && size == db->db.db_size) {
-		dbuf_dirty_record_cleanup_ranges(dr);
-		goto out;
-	}
-
-	range = kmem_zalloc(sizeof (dbuf_dirty_range_t), KM_SLEEP);
-	range->start = offset;
-	range->size = size;
-	range->end = offset + size;
-
-	/*
-	 * This loop acts as an accumulator, merging dirty ranges if they
-	 * overlap or are adjacent, and in so doing leaving behind only one
-	 * range.  But if the new range must be inserted separately, it will
-	 * do so using the old range as a marker.
-	 */
-	for (old_range = list_head(&dl->write_ranges);
-	    old_range != NULL && old_range->start <= range->end;
-	    old_range = next_range) {
-		next_range = list_next(&dl->write_ranges, old_range);
-		if (range->start <= old_range->end &&
-		    range->end >= old_range->start) {
-			old_range->start = MIN(range->start, old_range->start);
-			old_range->end = MAX(range->end, old_range->end);
-			old_range->size = old_range->end - old_range->start;
-			list_remove(&dl->write_ranges, old_range);
-			DEBUG_REFCOUNT_DEC(dirty_ranges_in_flight);
-			kmem_free(range, sizeof (dbuf_dirty_range_t));
-			range = old_range;
-		}
-	}
-
-	/* If the writer will finish filling, go directly to DB_FILL. */
-	if (range->start == 0 && range->size == db->db.db_size) {
-		kmem_free(range, sizeof (dbuf_dirty_range_t));
-	} else {
-		/* If old_range is NULL, this does a list_insert_tail(). */
-		list_insert_before(&dl->write_ranges, old_range, range);
-		DEBUG_REFCOUNT_INC(dirty_ranges_in_flight);
-		DEBUG_COUNTER_INC(dirty_ranges_total);
-	}
-
-	dbuf_dirty_record_check_ranges(dr);
-
-out:
-	if (dr->dr_dbuf->db_state & (DB_READ|DB_PARTIAL))
-		if (list_is_empty(&dr->dt.dl.write_ranges))
-			DBUF_STATE_CHANGE(db, =, DB_FILL, "complete filler");
-}
-
-static void
 dbuf_dirty_set_data(dbuf_dirty_state_t *dds)
 {
 	arc_buf_t *buf = dds->dds_fill_buf;
@@ -2229,7 +1876,7 @@ dbuf_dirty_leaf_with_existing_frontend(dbuf_dirty_state_t *dds)
 			 * scheduled its write with its buffer, we must
 			 * disassociate by replacing the frontend.
 			 */
-			ASSERT(db->db_state & (DB_READ|DB_PARTIAL));
+			ASSERT(db->db_state == DB_READ);
 			ASSERT3U(db->db_dirtycnt, ==, 1);
 			dbuf_dirty_set_data(dds);
 		} else {
@@ -2391,45 +2038,6 @@ dbuf_dirty_bonus(dmu_buf_impl_t *db, dmu_tx_t *tx)
 }
 
 /*
- * Handle potential Copy-On-Write (COW) faults.
- *
- * This function's primary purpose is to optimize dirtying behavior that are
- * likely to involve COW faults.
- */
-static void
-dbuf_dirty_handle_fault(dbuf_dirty_state_t *dds)
-{
-	dmu_buf_impl_t *db = dds->dds_db;
-
-	ASSERT0(db->db_level);
-	if (db->db_state & DB_PARTIAL) {
-		dbuf_dirty_record_t *dr = list_head(&db->db_dirty_records);
-		if (dr->dr_txg != dds->dds_tx->tx_txg) {
-			/*
-			 * The newest dirty record's transaction group has
-			 * closed.  Since COW fault resolution can't be
-			 * avoided, there is no benefit to waiting until the
-			 * dirty record reaches the syncer.  Start
-			 * asynchronous fault resolution now.
-			 */
-			dbuf_transition_to_read(db);
-		}
-	} else if (db->db_state == DB_UNCACHED) {
-		int write_end = dds->dds_offset + dds->dds_size;
-
-		if (dds->dds_offset != 0 && write_end != db->db.db_size) {
-			/*
-			 * Immediately start resolving a COW fault if we start
-			 * writing inside the block rather than either at the
-			 * beginning (forward) or end (backward).  Future
-			 * writes are unlikely to fill this dbuf.
-			 */
-			dbuf_transition_to_read(db);
-		}
-	}
-}
-
-/*
  * Common dbuf_dirty_enter() replacement for leaf blocks.
  */
 void
@@ -2440,11 +2048,6 @@ dbuf_dirty_leaf_enter(dbuf_dirty_state_t *dds,
 	dbuf_dirty_enter(dds, db, tx);
 	dds->dds_offset = offset;
 	dds->dds_size = size;
-	/*
-	 * Handle COW faults prior to computing the dirty state, since
-	 * transitioning to read drops the lock.
-	 */
-	dbuf_dirty_handle_fault(dds);
 	dbuf_dirty_compute_state(dds);
 }
 
@@ -2533,30 +2136,6 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 			return (dbuf_dirty_leaf(db, tx, 0, db->db.db_size));
 	} else {
 		return (dbuf_dirty_indirect(db, tx));
-	}
-}
-
-/*
- * Cleanup a dirty record's write ranges as necessary.
- *
- * XXX: This should be replaced with a larger dbuf_dirty_record_destroy()
- *      that cleans up an entire dirty record.
- */
-void
-dbuf_dirty_record_cleanup_ranges(dbuf_dirty_record_t *dr)
-{
-	dbuf_dirty_leaf_record_t *dl;
-	dbuf_dirty_range_t *range;
-
-	/* Write ranges do not apply to indirect blocks */
-	if (dr->dr_dbuf->db_level != 0)
-		return;
-
-	/* Remove any write range entries left behind. */
-	dl = &dr->dt.dl;
-	while ((range = list_remove_head(&dl->write_ranges)) != NULL) {
-		kmem_free(range, sizeof (dbuf_dirty_range_t));
-		DEBUG_REFCOUNT_DEC(dirty_ranges_in_flight);
 	}
 }
 
@@ -2681,8 +2260,6 @@ dbuf_undirty_write(dbuf_dirty_record_t *dr, uint64_t txg)
 	/* Clean up the dirty record. */
 	if (db->db_level == 0) {
 		dbuf_undirty_leaf(dr);
-		dbuf_dirty_record_cleanup_ranges(dr);
-		list_destroy(&dr->dt.dl.write_ranges);
 	} else {
 		dbuf_undirty_indirect(dr);
 	}
@@ -2770,8 +2347,6 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 			VERIFY(arc_buf_remove_ref(dr->dt.dl.dr_data, db));
 	}
 
-	dbuf_dirty_record_cleanup_ranges(dr);
-	list_destroy(&dr->dt.dl.write_ranges);
 	kmem_free(dr, sizeof (dbuf_dirty_record_t));
 
 	ASSERT(db->db_dirtycnt > 0);
@@ -2853,7 +2428,7 @@ dbuf_transition_to_read(dmu_buf_impl_t *db)
 	zio_t *zio = NULL;
 
 	ASSERT(MUTEX_HELD(&db->db_mtx));
-	ASSERT(db->db_state & (DB_PARTIAL|DB_UNCACHED));
+	ASSERT3U(db->db_state, ==, DB_UNCACHED);
 
 	DB_DNODE_ENTER(db);
 	dn = DB_DNODE(db);
@@ -2948,24 +2523,11 @@ dbuf_fill_done(dmu_buf_impl_t *db, dmu_tx_t *tx)
 			/* XXX dbuf_undirty? */
 			bzero(db->db.db_data, db->db.db_size);
 			db->db_freed_in_flight = FALSE;
-			dbuf_dirty_record_cleanup_ranges(dr);
 			DBUF_STATE_CHANGE(db, =, DB_CACHED,
 			    "fill done handling freed in flight");
 		} else {
-			/*
-			 * This function can be called with another state bit
-			 * set, but if FILL is the only bit set, then the
-			 * buffer has been fully filled.  Otherwise, clear the
-			 * FILL bit, so it goes back to the steady state.
-			 */
-			if (db->db_state == DB_FILL) {
-				DBUF_STATE_CHANGE(db, =, DB_CACHED,
-				    "filler finished, complete buffer");
-			} else {
-				DBUF_STATE_CHANGE(db, &=, ~DB_FILL,
-				    "filler finished, incomplete buffer");
-				ASSERT(db->db_state & (DB_PARTIAL|DB_READ));
-			}
+			DBUF_STATE_CHANGE(db, =, DB_CACHED,
+			    "filler finished, complete buffer");
 		}
 		cv_broadcast(&db->db_changed);
 	}
@@ -4005,27 +3567,6 @@ dbuf_check_blkptr(dnode_t *dn, dmu_buf_impl_t *db)
 	}
 }
 
-boolean_t
-dbuf_resolve_still_pending(dbuf_dirty_record_t *dr, zio_t **dr_zio, zio_t *zio)
-{
-	/* Resolve race with dbuf_read_complete()/dbuf_free_range() */
-	boolean_t resolve_pending;
-	mutex_enter(&dr->dr_dbuf->db_mtx);
-	resolve_pending = !list_is_empty(&dr->dt.dl.write_ranges);
-	if (resolve_pending) {
-		ASSERT(*dr_zio == NULL);
-		*dr_zio = zio;
-#ifdef ZFS_DEBUG
-		if (dr_zio == &dr->dr_zio)
-			DEBUG_COUNTER_INC(syncer_deferred_resolves);
-		else
-			ASSERT(!"unexpected zio_t **dr_zio!");
-#endif
-	}
-	mutex_exit(&dr->dr_dbuf->db_mtx);
-	return (resolve_pending);
-}
-
 static void
 dbuf_sync_indirect(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 {
@@ -4104,22 +3645,12 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 	objset_t *os;
 	zio_t *zio;
 	uint64_t txg = tx->tx_txg;
-	boolean_t resolve_pending;
 
 	ASSERT(dmu_tx_is_syncing(tx));
 
 	dprintf_dbuf_bp(db, db->db_blkptr, "blkptr=%p", db->db_blkptr);
 
 	mutex_enter(&db->db_mtx);
-	if (db->db_state & DB_PARTIAL) {
-		/*
-		 * Time has run out for waiting on any writer to fill
-		 * this buffer.
-		 */
-		ASSERT(arc_released(*datap));
-		dbuf_transition_to_read(db);
-	}
-
 	/*
 	 * To be synced, we must be dirtied.  But we
 	 * might have been freed after the dirty.
@@ -4127,7 +3658,7 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 	if (db->db_state == DB_UNCACHED) {
 		/* This buffer has been freed since it was dirtied */
 		ASSERT(db->db.db_data == NULL);
-	} else if (db->db_state & DB_FILL) {
+	} else if (db->db_state == DB_FILL) {
 		/*
 		 * This buffer is being modified.  Those modifications
 		 * should be in a newer transaction group and not
@@ -4179,15 +3710,11 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 		ASSERT(dr->dt.dl.dr_override_state != DR_NOT_OVERRIDDEN);
 	}
 
-	/* Remember if we need to defer write execution to dbuf_read_done(). */
-	resolve_pending = !list_is_empty(&dr->dt.dl.write_ranges);
-
 	/*
 	 * Syncer splits must be deferred until the buffer contents
 	 * are fully valid.
 	 */
-	if (resolve_pending == B_FALSE &&
-	    dn->dn_object != DMU_META_DNODE_OBJECT)
+	if (dn->dn_object != DMU_META_DNODE_OBJECT)
 		dbuf_syncer_split(db, dr, /*deferred_split*/B_FALSE);
 
 	/* Notify the world that this dirty record is about to write. */
@@ -4197,12 +3724,6 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 	mutex_exit(&db->db_mtx);
 
 	zio = dbuf_write(dr, *datap, tx);
-
-	if (resolve_pending &&
-	    dbuf_resolve_still_pending(dr, &dr->dr_zio, zio)) {
-		DB_DNODE_EXIT(db);
-		return;
-	}
 
 	dr->dr_zio = zio;
 	ASSERT(!list_link_active(&dr->dr_dirty_node));
